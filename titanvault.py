@@ -80,6 +80,9 @@ JD_TIMEOUT_SEC     = int(os.getenv("JD_TIMEOUT_SEC", "3600"))
 BRIDGE_ENABLE      = os.getenv("BRIDGE_ENABLE", "1") != "0"
 BRIDGE_PORT        = int(os.getenv("BRIDGE_PORT", "8765"))
 BRIDGE_EXT_ID      = os.getenv("BRIDGE_EXT_ID", "").strip()   # optional: pin your extension ID
+# ── Streamlink resolver fallback (optional pip package "streamlink") ──
+STREAMLINK_ENABLE  = os.getenv("STREAMLINK_ENABLE", "1") != "0"
+STREAMLINK_TIMEOUT = int(os.getenv("STREAMLINK_TIMEOUT", "30"))
 MAX_PARALLEL_DOWNLOADS = 3
 DOWNLOAD_QUEUE_WORKERS = 2
 
@@ -1343,6 +1346,61 @@ def _scrape_real_url(url: str) -> tuple:
 
 
 # ══════════════════════════════════════════════════════
+#  STREAMLINK RESOLVER FALLBACK (independent plugin set)
+#   Streamlink keeps its own site plugins, maintained separately from yt-dlp.
+#   When a yt-dlp extractor breaks, Streamlink's plugin for the same service
+#   can still resolve the page to a playable HLS/DASH/direct URL.
+#   Optional dependency: pip install streamlink. Missing package = skipped.
+# ══════════════════════════════════════════════════════
+_STREAMLINK_SAFE_HEADERS = ("user-agent", "referer", "origin", "accept", "accept-language")
+
+def _streamlink_pick(streams: dict):
+    """Choose the best stream object from a streamlink streams dict."""
+    if not streams:
+        return None
+    for name in ("best", "source", "1080p", "720p", "480p", "360p"):
+        if name in streams:
+            return streams[name]
+    return list(streams.values())[-1]
+
+def _streamlink_resolve(page_url: str) -> dict:
+    """Resolve a page URL to a playable stream via Streamlink's own plugins.
+
+    Returns {"url", "headers"} or None. Never raises; unsupported URLs and a
+    missing package both return None so the fallback chain just continues.
+    Headers are filtered to a safe allowlist (no cookies) and CRLF-stripped.
+    """
+    if not STREAMLINK_ENABLE:
+        return None
+    try:
+        import streamlink
+    except ImportError:
+        logging.warning("[streamlink] package not installed; resolver fallback disabled")
+        return None
+    try:
+        session = streamlink.Streamlink()
+        session.set_option("http-timeout", STREAMLINK_TIMEOUT)
+        session.set_option("stream-timeout", STREAMLINK_TIMEOUT)
+        streams = session.streams(page_url)
+    except Exception as e:
+        logging.warning(f"[streamlink] no stream for {redact_url(page_url)}: {type(e).__name__}")
+        return None
+    st = _streamlink_pick(streams)
+    url = getattr(st, "url", "") if st else ""
+    if not url or not _valid_http_url(url):
+        return None
+    raw = dict(getattr(getattr(session, "http", None), "headers", {}) or {})
+    args_headers = getattr(st, "args", None)
+    if isinstance(args_headers, dict) and isinstance(args_headers.get("headers"), dict):
+        raw.update(args_headers["headers"])
+    headers = {}
+    for k, v in raw.items():
+        if str(k).lower() in _STREAMLINK_SAFE_HEADERS:
+            headers[str(k)] = re.sub(r"[\r\n]", "", str(v)).strip()[:500]
+    return {"url": url, "headers": headers}
+
+
+# ══════════════════════════════════════════════════════
 #  ARIA2C & DIRECT FILE DOWNLOAD ENGINE
 # ══════════════════════════════════════════════════════
 async def _do_dl_via_aria2c(url: str, out_file: str, status_msg, cancel_flag: list, headers: dict = None) -> bool:
@@ -1696,7 +1754,9 @@ async def _do_dl_via_cffi(url: str, status_msg, cancel_flag: list, uid: int, cha
 
     await _finish_upload(result_file, title, status_msg, uid, chat_id)
 
-async def _do_dl_via_ffmpeg_hls(url: str, status_msg, cancel_flag: list, uid: int, chat_id: int, page_url: str = "", title: str = "", referer: str = ""):
+async def _do_dl_via_ffmpeg_hls(url: str, status_msg, cancel_flag: list, uid: int, chat_id: int, page_url: str = "", title: str = "", referer: str = "", extra_headers: dict = None):
+    extra_headers = {str(k): re.sub(r"[\r\n]", "", str(v)).strip()[:500] for k, v in (extra_headers or {}).items()
+                     if str(k).lower() in ("user-agent", "referer", "origin", "accept", "accept-language")}
     clean_url = url.replace("&amp;", "&").replace("\\", "").strip()
     _referer = clean_referer(referer or page_url or clean_url)
     base_referer = f"{urlparse(_referer).scheme}://{urlparse(_referer).netloc}/"
@@ -1729,6 +1789,7 @@ async def _do_dl_via_ffmpeg_hls(url: str, status_msg, cancel_flag: list, uid: in
             "Accept-Language": _STANDARD_LANG,
             "Referer": clean_referer(ref_to_use),
         }
+        headers_dict.update(extra_headers)   # resolver session context (e.g. streamlink) wins
         ydl_opts = {
             "format": "bestvideo+bestaudio/best",
             "outtmpl": ydl_out,
@@ -1756,7 +1817,9 @@ async def _do_dl_via_ffmpeg_hls(url: str, status_msg, cancel_flag: list, uid: in
 
     # FFmpeg fallback with stream repair & resilience flags
     await safe_edit(status_msg, "⚡ *Retrying stream via FFmpeg core...*", force=True)
-    header_str = f"User-Agent: {_STANDARD_UA}\r\nAccept-Language: {_STANDARD_LANG}\r\nReferer: {_referer}\r\n"
+    _ff_hdrs = {"User-Agent": _STANDARD_UA, "Accept-Language": _STANDARD_LANG, "Referer": _referer}
+    _ff_hdrs.update(extra_headers)
+    header_str = "".join(f"{k}: {v}\r\n" for k, v in _ff_hdrs.items())
     ff_cmd = [
         FFMPEG_PATH, "-y",
         "-protocol_whitelist", "file,http,https,tcp,tls,crypto,data",
@@ -2167,6 +2230,15 @@ async def _do_dl(url: str, reply_msg, chat_id: int):
     try:
         await safe_edit(status, "🔍 *Step 1/4: Resolving stream link...*", reply_markup=CANCEL_KB, force=True)
         real_url, scraped_title, scraper_ref = await asyncio.to_thread(_scrape_real_url, url)
+        sl_headers = {}
+
+        if not real_url or real_url == url:
+            sl_res = await asyncio.to_thread(_streamlink_resolve, url)
+            if sl_res and sl_res.get("url"):
+                real_url = sl_res["url"]
+                sl_headers = sl_res.get("headers", {})
+                scraper_ref = sl_headers.get("Referer") or scraper_ref or url
+                await safe_edit(status, "🔍 *Step 1/4: Streamlink resolved a stream...*", reply_markup=CANCEL_KB, force=True)
 
         if not real_url or real_url == url:
             snatch_res = await universal_snatch(url, status)
@@ -2182,7 +2254,7 @@ async def _do_dl(url: str, reply_msg, chat_id: int):
         if (".m3u8" in clean_target_url or clean_target_url.split("?")[0].endswith(".m3u8") 
             or ".mpd" in clean_target_url or "/manifest" in clean_target_url):
             await safe_edit(status, "📥 *Step 2/4: Stream found (HLS/DASH)!*\nStarting downloader...", reply_markup=CANCEL_KB, force=True)
-            await _do_dl_via_ffmpeg_hls(clean_target_url, status, cancel_flag, uid, chat_id, page_url=url, title=scraped_title, referer=ref_header)
+            await _do_dl_via_ffmpeg_hls(clean_target_url, status, cancel_flag, uid, chat_id, page_url=url, title=scraped_title, referer=ref_header, extra_headers=sl_headers)
             return
 
         # 2. Check if a real CDN / video link was resolved
@@ -2192,6 +2264,7 @@ async def _do_dl(url: str, reply_msg, chat_id: int):
 
         if is_dood or path_ext or is_resolved_stream:
             direct_hdrs = build_direct_headers(clean_target_url, ref_header, _STANDARD_UA)
+            direct_hdrs.update(sl_headers)   # streamlink session headers (allowlisted, no cookies) win
             await safe_edit(status, "📥 *Step 2/4: Direct video stream detected (downloading)...*", reply_markup=CANCEL_KB, force=True)
             if is_dood:
                 await _do_dl_via_cffi(clean_target_url, status, cancel_flag, uid, chat_id, headers=direct_hdrs, title=scraped_title, page_url=ref_header)
@@ -2768,7 +2841,7 @@ async def help_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
         "`/status` — vault stats",
         "`/quiet` — toggle silent saves",
     ]
-    if owner: lines += ["\n*Owner*", "`/session` — get Telethon session string", "`/pair` — pair the browser extension", "`/unpair` — revoke paired browsers"]
+    if owner: lines += ["\n*Owner*", "`/session` — get Telethon session string", "`/pair` — pair the browser extension", "`/catcatch` — token + setup for cat-catch", "`/unpair` — revoke paired browsers"]
     await u.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def status_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
@@ -3157,7 +3230,75 @@ class _BridgeHandler(BaseHTTPRequestHandler):
             return
         self._send(404, {"ok": False})
 
+    def _do_jsonrpc(self):
+        # aria2 JSON-RPC subset so generic browser detectors (e.g. cat-catch) can hand
+        # off a detected media URL. Auth is the standard aria2 "token:<secret>" param,
+        # matched against the same paired bridge tokens. Origin, when present, must be
+        # a browser extension (any id; the BRIDGE_EXT_ID pin only guards the TitanVault
+        # extension endpoints). Only http(s) URLs plus an optional Referer are honored:
+        # no dir/out paths, no cookies, no commands.
+        host = (self.headers.get("Host") or "").lower()
+        if host not in (f"127.0.0.1:{BRIDGE_PORT}", f"localhost:{BRIDGE_PORT}"):
+            return self._send(403, {"ok": False, "error": "bad host"})
+        origin = self.headers.get("Origin", "")
+        if origin and not origin.startswith(("chrome-extension://", "moz-extension://")):
+            return self._send(403, {"ok": False, "error": "bad origin"})
+        data = self._json_body()
+        if data is None or not isinstance(data, dict): return
+        rpc_id = data.get("id")
+        method = str(data.get("method", ""))
+        params = data.get("params")
+        params = list(params) if isinstance(params, list) else []
+        tok = ""
+        if params and isinstance(params[0], str) and params[0].startswith("token:"):
+            tok = params.pop(0)[6:].strip()
+        chat = _bridge_token_chat(tok)
+        if chat is None:
+            return self._send(401, {"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32001, "message": "not paired"}})
+        if method == "aria2.getVersion":
+            return self._send(200, {"jsonrpc": "2.0", "id": rpc_id, "result": {"version": "TitanVaultBridge/1.1", "enabledFeatures": []}})
+        if method != "aria2.addUri":
+            return self._send(200, {"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32601, "message": "method not supported"}})
+        uris = params[0] if params and isinstance(params[0], list) else []
+        url = ""
+        for u in uris:
+            u = str(u).strip()
+            if _valid_http_url(u):
+                url = u
+                break
+        if not url:
+            return self._send(200, {"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32002, "message": "need an http(s) url"}})
+        opts = params[1] if len(params) > 1 and isinstance(params[1], dict) else {}
+        referer = ""
+        hdr_list = opts.get("header") or []
+        if isinstance(hdr_list, str): hdr_list = [hdr_list]
+        for line in hdr_list[:10]:
+            name, _, value = str(line).partition(":")
+            name = name.strip().lower()
+            value = re.sub(r"[\r\n]", " ", value).strip()[:500]
+            if name == "referer" and _valid_http_url(value):
+                referer = clean_referer(value)
+        # cat-catch sends its download filename as aria2 "out": use it as a display
+        # title only, never as a path. "dir" is dropped entirely.
+        title = ""
+        out_name = str(opts.get("out", "")).strip()
+        if out_name:
+            title = re.sub(r"[\r\n\t]", " ", out_name.replace("\\", "/").rsplit("/", 1)[-1])[:120]
+        with _bridge_lock:
+            now = time.time()
+            _send_times[:] = [t for t in _send_times if now - t < 60]
+            if len(_send_times) >= 10:
+                return self._send(429, {"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32029, "message": "rate limited"}})
+            _send_times.append(now)
+        loop, bot = BRIDGE_CTX["loop"], BRIDGE_CTX["bot"]
+        if not loop or not bot:
+            return self._send(503, {"jsonrpc": "2.0", "id": rpc_id, "error": {"code": -32003, "message": "bot not ready"}})
+        asyncio.run_coroutine_threadsafe(_bridge_launch(bot, chat, url, referer, title), loop)
+        self._send(200, {"jsonrpc": "2.0", "id": rpc_id, "result": secrets.token_hex(8)})
+
     def do_POST(self):
+        if self.path == "/jsonrpc":
+            return self._do_jsonrpc()
         if not self._guard(): return
         data = self._json_body()
         if data is None or not isinstance(data, dict): return
@@ -3269,6 +3410,22 @@ async def unpair_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
         conn.commit()
     await u.message.reply_text(f"🔌 Revoked {n} paired browser(s).")
 
+async def catcatch_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(u.effective_user.id): return
+    if not BRIDGE_ENABLE:
+        return await u.message.reply_text("Browser bridge is disabled (BRIDGE_ENABLE=0).")
+    tok = secrets.token_urlsafe(32)
+    with get_db() as conn:
+        conn.execute("INSERT INTO bridge_tokens (token_hash, chat_id) VALUES (?,?)", (_hash_token(tok), u.effective_chat.id))
+        conn.commit()
+    await u.message.reply_text(
+        "🐈 *cat-catch setup* (keep this secret):\n"
+        f"1. cat-catch Settings → Aria2 RPC → enable\n"
+        f"2. RPC address: `http://127.0.0.1:{BRIDGE_PORT}/jsonrpc`\n"
+        f"3. Token/secret: `{tok}`\n"
+        "Then press the aria2 icon on a detected stream. Only the URL and its Referer are accepted; cookies, paths and filenames are never executed. /unpair revokes it.",
+        parse_mode="Markdown")
+
 async def main():
     init_db()
 
@@ -3329,6 +3486,7 @@ async def main():
     app.add_handler(CommandHandler("kept",      kept_cmd))
     app.add_handler(CommandHandler("pair",      pair_cmd))
     app.add_handler(CommandHandler("unpair",    unpair_cmd))
+    app.add_handler(CommandHandler("catcatch",  catcatch_cmd))
     app.add_handler(CommandHandler("mp3",       mp3_cmd))
     app.add_handler(CommandHandler("thumb",     thumb_cmd))
     app.add_handler(CommandHandler("viewthumb", viewthumb_cmd))
