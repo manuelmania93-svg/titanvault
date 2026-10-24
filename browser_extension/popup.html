@@ -1,0 +1,23 @@
+<!doctype html>
+<meta charset="utf-8">
+<style>
+  body { font: 13px system-ui, sans-serif; width: 360px; margin: 10px; }
+  button { cursor: pointer; }
+  .row { border-top: 1px solid #ddd; padding: 6px 0; word-break: break-all; }
+  .small { color: #666; font-size: 11px; }
+  #status { margin: 6px 0; min-height: 1.2em; }
+  input { width: 120px; }
+</style>
+<h3 style="margin:0 0 6px">TitanVault Handoff</h3>
+<div id="status"></div>
+<div id="pairbox" hidden>
+  <div class="small">Send <b>/pair</b> to your bot, then enter the code:</div>
+  <input id="code" placeholder="pairing code" autocomplete="off"> <button id="pair">Pair</button>
+</div>
+<div id="permbox" hidden>
+  <div class="small">Detection is off. Chrome will ask for permission to see network requests on websites. Only the stream URL you choose is ever sent, and only to 127.0.0.1.</div>
+  <button id="perm">Enable detection</button>
+</div>
+<div id="list"></div>
+<div class="small" style="margin-top:8px"><a href="#" id="unpair">Forget pairing</a></div>
+<script src="popup.js"></script>
