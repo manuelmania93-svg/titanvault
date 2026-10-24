@@ -62,6 +62,16 @@ FFMPEG_PATH        = "ffmpeg"
 FFPROBE_PATH       = "ffprobe"
 FFPROBE_TIMEOUT    = 10
 MAX_UPLOAD_BYTES   = 2 * 1024 * 1024 * 1024   # 2 GB
+STALL_WARN_SECS    = int(os.getenv("STALL_WARN_SECS", "25"))       # ffmpeg silent this long = flag it
+AUDIO_EXTS         = (".mp3", ".m4a", ".opus", ".flac", ".aac")
+
+# Download quality policy: highest available resolution up to 1080p; codec is only a
+# tie-break at equal resolution (yt-dlp default order). Above-1080p sources only when
+# nothing <=1080p exists, and then the CLOSEST higher variant, never failing over the ceiling.
+YDL_FORMAT = ("bestvideo[height<=1080]+bestaudio[acodec^=mp4a]/"
+              "bestvideo[height<=1080]+bestaudio/"
+              "worstvideo[height>1080]+bestaudio/"
+              "bestvideo+bestaudio/best")
 TELETHON_UPLOAD_WORKERS = 8
 SILENT_MODE        = [True]
 
@@ -127,6 +137,7 @@ dl_cancel_flags: dict = {}
 save_queues:    dict = {}
 save_workers:   dict = {}
 user_thumbnails: dict = {}
+user_convert: dict = {}          # uid -> convert spec (see /convert)
 
 batch_queues: dict = {}
 user_series_prefix: dict = {}
@@ -246,6 +257,13 @@ def fmt_size(b: int) -> str:
     if b >= 1_073_741_824: return f"{b/1_073_741_824:.1f} GB"
     if b >= 1_048_576:     return f"{b/1_048_576:.1f} MB"
     return f"{b/1024:.0f} KB"
+
+def fmt_clock(sec: float) -> str:
+    sec = max(0, int(sec))
+    if sec >= 3600:
+        return f"{sec//3600}:{(sec%3600)//60:02d}:{sec%60:02d}"
+    return f"{sec//60}:{sec%60:02d}"
+
 
 def progress_bar(done: int, total: int, width: int = 16) -> str:
     if total <= 0: return "[" + "░" * width + "] ?"
@@ -1503,19 +1521,326 @@ def _probe_has_media_stream(path: str) -> bool:
         return False
 
 
-def remux_for_streaming(src: str) -> str:
+def _probe_duration(path: str) -> float:
+    try:
+        r = subprocess.run(
+            [FFPROBE_PATH, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=60)
+        return float((r.stdout or "").strip())
+    except Exception:
+        return 0.0
+
+async def _run_ffmpeg_live(cmd, total_dur: float, status_msg, label: str,
+                           cancel_flag=None, timeout: int = 14400):
+    """Run ffmpeg with '-progress pipe:1' and stream live progress into the status message.
+
+    Shows: percent bar, position/total, speed, ETA, elapsed, bytes written, and an
+    explicit "stalled Ns" flag when out_time stops advancing. Kills ffmpeg on cancel.
+    """
+    full = list(cmd)
+    if "-progress" not in full:
+        full = full[:-1] + ["-progress", "pipe:1", "-nostats", full[-1]]
+
+    proc = await asyncio.create_subprocess_exec(
+        *full,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+        stdin=asyncio.subprocess.DEVNULL)
+
+    t0 = time.time()
+    st = {"pos": 0.0, "speed": "?", "size": 0, "last_move": time.time(), "last_edit": 0.0}
+
+    async def _reader():
+        while True:
+            try:
+                line = await proc.stdout.readline()
+            except Exception:
+                return
+            if not line:
+                return
+            s = line.decode(errors="replace").strip()
+            if s.startswith("out_time_us="):
+                try:
+                    pos = int(s.split("=", 1)[1]) / 1_000_000
+                    if pos > st["pos"] + 0.05:
+                        st["pos"] = pos
+                        st["last_move"] = time.time()
+                except Exception:
+                    pass
+            elif s.startswith("out_time="):
+                try:
+                    parts = s.split("=", 1)[1].split(":")
+                    pos = int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+                    if pos > st["pos"] + 0.05:
+                        st["pos"] = pos
+                        st["last_move"] = time.time()
+                except Exception:
+                    pass
+            elif s.startswith("total_size="):
+                try: st["size"] = int(s.split("=", 1)[1])
+                except Exception: pass
+            elif s.startswith("speed="):
+                st["speed"] = s.split("=", 1)[1].strip()
+
+    async def _ticker():
+        while proc.returncode is None:
+            await asyncio.sleep(2.0)
+            if proc.returncode is not None:
+                break
+            if cancel_flag and cancel_flag[0]:
+                try: proc.kill()
+                except Exception: pass
+                return
+            now = time.time()
+            if now - st["last_edit"] < 2.0:
+                continue
+            st["last_edit"] = now
+            el   = int(now - t0)
+            idle = int(now - st["last_move"])
+            stall = f"  ⚠️ *no progress {idle}s*" if idle > STALL_WARN_SECS else ""
+
+            eta = ""
+            try:
+                sp = float(st["speed"].rstrip("x"))
+                if sp > 0.01 and total_dur > 1:
+                    eta = f" · ETA {fmt_clock((total_dur - st['pos']) / sp)}"
+            except Exception:
+                pass
+
+            tail = f"{st['speed']}{eta} · {fmt_size(st['size'])} · elapsed {fmt_clock(el)}"
+            if total_dur and total_dur > 1:
+                pct = min(100.0, st["pos"] / total_dur * 100)
+                bar = "▓" * int(16 * pct / 100) + "░" * (16 - int(16 * pct / 100))
+                await safe_edit(status_msg,
+                    f"{label}\n\n[{bar}] {pct:.1f}%\n"
+                    f"_{fmt_clock(st['pos'])} / {fmt_clock(total_dur)} · {tail}_{stall}")
+            else:
+                await safe_edit(status_msg, f"{label}\n\n_{tail}_{stall}")
+
+    rt = asyncio.ensure_future(_reader())
+    tt = asyncio.ensure_future(_ticker())
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        try: proc.kill()
+        except Exception: pass
+        try: await proc.wait()
+        except Exception: pass
+    except asyncio.CancelledError:
+        try: proc.kill()
+        except Exception: pass
+        raise
+    finally:
+        tt.cancel()
+        rt.cancel()
+    return proc.returncode
+
+def _remux_attempts(src: str, out: str) -> list:
+    return [
+        # 1: clean copy, drop data/subtitle streams MP4 cannot hold (e.g. timed_id3)
+        [FFMPEG_PATH, "-y", "-i", src, "-map", "0:v?", "-map", "0:a?",
+         "-c", "copy", "-bsf:a", "aac_adtstoasc", "-movflags", "+faststart", out],
+        # 2: carry text subs as mov_text
+        [FFMPEG_PATH, "-y", "-i", src, "-map", "0:v?", "-map", "0:a?", "-map", "0:s?",
+         "-c", "copy", "-c:s", "mov_text", "-bsf:a", "aac_adtstoasc",
+         "-movflags", "+faststart", out],
+        # 3: re-encode audio only (mp2 / ac3 / pcm -> aac)
+        [FFMPEG_PATH, "-y", "-i", src, "-map", "0:v?", "-map", "0:a?",
+         "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+         "-movflags", "+faststart", out],
+    ]
+
+async def _remux_live(src: str, status_msg, label: str = "⚙️ *Optimising video format*",
+                      cancel_flag=None) -> str:
+    """Same three-attempt remux as remux_for_streaming, but with live progress."""
     base, _ = os.path.splitext(src)
     out = base + "_stream.mp4"
     if out == src: out = base + "_fs.mp4"
-    cmd = [FFMPEG_PATH, "-y", "-i", src, "-c", "copy", "-movflags", "+faststart", out]
+    dur = await asyncio.to_thread(_probe_duration, src)
+    for i, cmd in enumerate(_remux_attempts(src, out), 1):
+        try:
+            if os.path.exists(out):
+                try: os.remove(out)
+                except Exception: pass
+            rc = await _run_ffmpeg_live(cmd, dur, status_msg,
+                                        f"{label} (attempt {i}/3)",
+                                        cancel_flag=cancel_flag)
+            if rc == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
+                try: os.remove(src)
+                except Exception: pass
+                return out
+        except Exception as e:
+            logging.warning(f"[remux live] attempt {i} failed: {e}")
+    return src
+
+async def _remux_to_live(src: str, container: str, status_msg=None, cancel_flag=None) -> str:
+    base, _ = os.path.splitext(src)
+    out = f"{base}_remux.{container}"
+    cmd = [FFMPEG_PATH, "-y", "-i", src, "-map", "0:v?", "-map", "0:a?", "-c", "copy"]
+    if container in ("mp4", "mov"):
+        cmd += ["-bsf:a", "aac_adtstoasc", "-movflags", "+faststart"]
+    cmd += [out]
+    dur = await asyncio.to_thread(_probe_duration, src)
     try:
-        r = subprocess.run(cmd, capture_output=True, timeout=3600)
-        if r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
+        if os.path.exists(out):
+            try: os.remove(out)
+            except Exception: pass
+        rc = await _run_ffmpeg_live(cmd, dur, status_msg,
+                                    f"⚙️ *Remuxing → {container} (stream copy)*",
+                                    cancel_flag=cancel_flag)
+        if rc == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
             try: os.remove(src)
-            except: pass
+            except Exception: pass
             return out
     except Exception as e:
-        logging.warning("remux_for_streaming: " + str(e))
+        logging.warning(f"[remux_to_live] {e}")
+    return src
+
+def parse_convert_spec(tokens) -> dict:
+    """['720p','mkv','crf=21'] -> spec. Unknown tokens ignored, 'off' clears."""
+    spec = {}
+    for raw in tokens or []:
+        t = str(raw).strip().lower()
+        if not t:
+            continue
+        if t in ("off", "none", "reset", "clear"):
+            return {}
+        if t in ("mp4", "mkv", "mov", "ts"):
+            spec["container"] = t
+        elif t in ("h264", "avc", "x264"):
+            spec["vcodec"] = "libx264"
+        elif t in ("h265", "hevc", "x265"):
+            spec["vcodec"] = "libx265"
+        elif t in ("copy", "remux"):
+            spec["vcodec"] = "copy"
+        elif t in ("mp3", "m4a", "aac", "opus", "flac"):
+            spec["audio_only"] = True
+            spec["acodec"] = t
+        elif t in ("1080p", "720p", "480p", "360p"):
+            spec["scale"] = int(t[:-1])
+        elif t.startswith("crf"):
+            try:
+                spec["crf"] = max(0, min(51, int(t.replace("crf", "").lstrip("=:"))))
+            except ValueError:
+                pass
+        elif t.endswith("mb") or t.endswith("gb"):
+            try:
+                v = float(re.sub(r"[a-z]", "", t))
+                spec["target_mb"] = int(v * 1024) if t.endswith("gb") else int(v)
+            except ValueError:
+                pass
+        elif re.fullmatch(r"\d{1,4}m(?:in)?", t) or re.fullmatch(r"\d{1,2}h", t):
+            spec["cap_min"] = int(re.sub(r"\D", "", t)) * (60 if t.endswith("h") else 1)
+        elif t in ("full", "all", "complete", "entire"):
+            spec["cap_min"] = 0
+        elif re.fullmatch(r"\d{2,4}k", t):
+            spec["abr"] = t
+    return spec
+
+def describe_convert(spec: dict) -> str:
+    if not spec:
+        return "off (stream-copy remux only)"
+    if spec.get("audio_only"):
+        return f"audio-only -> {spec.get('acodec', 'mp3')}" + (f" @ {spec['abr']}" if spec.get("abr") else "")
+    bits = [spec.get("container") or "mp4"]
+    if spec.get("vcodec") and spec["vcodec"] != "copy":
+        bits.append(spec["vcodec"].replace("lib", ""))
+    if spec.get("crf"):
+        bits.append(f"crf{spec['crf']}")
+    if spec.get("scale"):
+        bits.append(f"{spec['scale']}p")
+    if spec.get("target_mb"):
+        bits.append(f"<={spec['target_mb']}MB")
+    if spec.get("abr"):
+        bits.append(f"abr {spec['abr']}")
+    if "cap_min" in spec:
+        bits.append("live full" if not spec["cap_min"] else f"live cap {spec['cap_min']}m")
+    return " | ".join(bits)
+
+async def apply_convert(src: str, spec: dict, status_msg=None, cancel_flag=None) -> str:
+    """Apply a convert spec. Returns the file to upload (src if nothing applied)."""
+    spec = spec or {}
+    loop = asyncio.get_running_loop()
+    base, _ = os.path.splitext(src)
+
+    # ── audio only ──────────────────────────────────────
+    if spec.get("audio_only"):
+        codec = spec.get("acodec") or "mp3"
+        ext = "m4a" if codec in ("m4a", "aac") else codec
+        out = f"{base}_audio.{ext}"
+        acodec = {"mp3": "libmp3lame", "m4a": "aac", "aac": "aac",
+                  "opus": "libopus", "flac": "flac"}.get(codec, "libmp3lame")
+        abr = spec.get("abr") or ("192k" if codec in ("mp3", "m4a", "aac") else "128k")
+        cmd = [FFMPEG_PATH, "-y", "-i", src, "-vn", "-c:a", acodec, "-b:a", abr, out]
+        dur = await asyncio.to_thread(_probe_duration, src)
+        try:
+            await _run_ffmpeg_live(cmd, dur, status_msg,
+                                   f"🎵 *Extracting audio ({codec})*", cancel_flag=cancel_flag)
+        except Exception:
+            await loop.run_in_executor(None, lambda: subprocess.run(cmd, capture_output=True, timeout=7200))
+        if os.path.exists(out) and os.path.getsize(out) > 0:
+            try: os.remove(src)
+            except Exception: pass
+            return out
+        return src
+
+    target_bytes = int(spec["target_mb"] * 1024 * 1024) if spec.get("target_mb") else MAX_UPLOAD_BYTES
+    need_encode = bool(spec.get("vcodec") not in (None, "copy")
+                       or spec.get("scale") or spec.get("crf") or spec.get("target_mb"))
+
+    if spec.get("target_mb") and not spec.get("vcodec") and not spec.get("scale") \
+            and os.path.getsize(src) <= target_bytes:
+        need_encode = False
+
+    container = spec.get("container") or ("mp4" if need_encode else None)
+
+    # ── remux only ──────────────────────────────────────
+    if not need_encode:
+        if container and not src.lower().endswith("." + container):
+            return await _remux_to_live(src, container, status_msg, cancel_flag)
+        return await _remux_live(src, status_msg, cancel_flag=cancel_flag)
+
+    # ── encode ──────────────────────────────────────────
+    out = f"{base}_conv.{container or 'mp4'}"
+    vf = ["-vf", f"scale=-2:{spec['scale']}"] if spec.get("scale") else []
+    vcodec = spec.get("vcodec") or "libx264"
+    preset = "veryfast" if vcodec == "libx265" else "fast"
+    abr = spec.get("abr") or "128k"
+    duration = await asyncio.to_thread(_probe_duration, src)
+
+    if spec.get("target_mb") and duration > 1:
+        audio_bps = int(re.sub(r"\D", "", abr) or 128) * 1000
+        vk = max(int(((target_bytes * 8) / duration - audio_bps) / 1000), 150)
+        plog = base + "_cpass"
+        p1 = [FFMPEG_PATH, "-y", "-i", src, *vf, "-c:v", vcodec, "-b:v", f"{vk}k",
+              "-preset", preset, "-pass", "1", "-an", "-passlogfile", plog, "-f", "null", os.devnull]
+        p2 = [FFMPEG_PATH, "-y", "-i", src, *vf, "-c:v", vcodec, "-b:v", f"{vk}k",
+              "-preset", preset, "-pass", "2", "-passlogfile", plog,
+              "-c:a", "aac", "-b:a", abr, "-movflags", "+faststart", out]
+        await _run_ffmpeg_live(p1, duration, status_msg,
+                               f"⚙️ *Encode · pass 1/2 (analysis)*\n_{vcodec.replace('lib','')} @ {vk}kbps_",
+                               cancel_flag=cancel_flag)
+        await _run_ffmpeg_live(p2, duration, status_msg,
+                               f"⚙️ *Encode · pass 2/2 → <={spec['target_mb']}MB*\n_{vcodec.replace('lib','')} @ {vk}kbps_",
+                               cancel_flag=cancel_flag)
+        for sfx in ("", "-0.log", "-0.log.mbtree"):
+            try: os.remove(plog + sfx)
+            except Exception: pass
+    else:
+        crf = str(spec.get("crf", 20))
+        cmd = [FFMPEG_PATH, "-y", "-i", src, *vf, "-c:v", vcodec, "-crf", crf,
+               "-preset", preset, "-c:a", "aac", "-b:a", abr,
+               "-movflags", "+faststart", out]
+        await _run_ffmpeg_live(cmd, duration, status_msg,
+                               f"⚙️ *Encoding {vcodec.replace('lib','')} crf{crf}"
+                               + (f", {spec['scale']}p" if spec.get("scale") else "") + "*",
+                               cancel_flag=cancel_flag)
+
+    if os.path.exists(out) and os.path.getsize(out) > 0:
+        try: os.remove(src)
+        except Exception: pass
+        return out
     return src
 
 def get_video_info(path: str):
@@ -1629,10 +1954,10 @@ async def compress_to_limit(src: str, status_msg) -> str:
     ]
 
     # SAFETY (added): check pass-1 exit code; on failure keep the original untouched.
-    p1 = await asyncio.create_subprocess_exec(*cmd_pass1, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
-    _, p1_err = await p1.communicate()
-    if p1.returncode != 0:
-        logging.error(f"Compression pass 1 failed (rc={p1.returncode}): {p1_err.decode(errors='ignore')[-400:]}")
+    p1_rc = await _run_ffmpeg_live(cmd_pass1, duration, status_msg,
+        f"⚙️ *Compressing video to fit 2 GB · pass 1/2*\n📦 `{fmt_size(filesize)}` ➔ `~{fmt_size(TARGET_BYTES)}` · `{video_kbps} kbps`")
+    if p1_rc != 0:
+        logging.error(f"Compression pass 1 failed (rc={p1_rc})")
         for sfx in ["", "-0.log", "-0.log.mbtree"]:
             if os.path.exists(pass_log + sfx):
                 try: os.remove(pass_log + sfx)
@@ -1657,42 +1982,9 @@ async def compress_to_limit(src: str, status_msg) -> str:
     ]
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd_pass2,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL
-        )
-
-        last_update = [0.0]
-        while proc.returncode is None:
-            line = await proc.stdout.readline()
-            if not line:
-                break
-            line_str = line.decode(errors="ignore").strip()
-
-            # Parse FFmpeg output time
-            if line_str.startswith("out_time_us="):
-                try:
-                    curr_us = int(line_str.split("=")[1])
-                    curr_sec = curr_us / 1_000_000
-                    now = time.time()
-                    if now - last_update[0] >= 3.0:
-                        last_update[0] = now
-                        pct = min(0.99, curr_sec / duration)
-                        bar = "▓" * int(16 * pct) + "░" * (16 - int(16 * pct))
-                        rem_sec = max(0, int((duration - curr_sec) / max(0.01, (pct * duration / (now - (now - curr_sec + 0.1))))))
-                        await safe_edit(
-                            status_msg,
-                            f"⚙️ *Compressing video to fit 2 GB...*\n"
-                            f"📦 Target: `~{fmt_size(TARGET_BYTES)}` (`{video_kbps} kbps`)\n\n"
-                            f"[{bar}] {int(pct*100)}%\n"
-                            f"⏱ Processed: `{int(curr_sec)}s / {int(duration)}s`",
-                        )
-                except Exception:
-                    pass
-
-        await proc.wait()
-        pass2_ok = (proc.returncode == 0)  # SAFETY (added)
+        rc2 = await _run_ffmpeg_live(cmd_pass2, duration, status_msg,
+            f"⚙️ *Compressing video to fit 2 GB · pass 2/2*\n📦 Target: `~{fmt_size(TARGET_BYTES)}` (`{video_kbps} kbps`)")
+        pass2_ok = (rc2 == 0)  # SAFETY (added)
     except Exception as e:
         pass2_ok = False
         logging.error(f"Compression error: {e}")
@@ -1834,7 +2126,7 @@ async def _do_dl_via_ffmpeg_hls(url: str, status_msg, cancel_flag: list, uid: in
         }
         headers_dict.update(extra_headers)  # allowlisted sniffer headers win
         ydl_opts = {
-            "format": "bestvideo+bestaudio/best",
+            "format": YDL_FORMAT,
             "outtmpl": ydl_out,
             "quiet": True,
             "no_warnings": True,
@@ -1884,7 +2176,7 @@ async def _do_dl_via_ffmpeg_hls(url: str, status_msg, cancel_flag: list, uid: in
 
     return False
 
-async def _finish_upload(file_path: str, title: str, status_msg, uid: int, chat_id: int) -> bool:
+async def _finish_upload(file_path: str, title: str, status_msg, uid: int, chat_id: int, skip_convert: bool = False) -> bool:
     loop  = asyncio.get_running_loop()
     t0    = time.time()
     last  = [0.0]
@@ -1904,10 +2196,28 @@ async def _finish_upload(file_path: str, title: str, status_msg, uid: int, chat_
         except Exception: pass
         return False
     try:
+        converted = False
+        if is_video and not skip_convert:
+            spec = user_convert.get(uid, {})
+            if spec:
+                await safe_edit(status_msg, f"⚙️ *Step 3/4: Converting ({describe_convert(spec)})...*", force=True)
+                tmp = await apply_convert(tmp, spec, status_msg)
+                converted = True
+                if os.path.splitext(tmp)[1].lower() in AUDIO_EXTS:
+                    is_video = False
         if is_video:
+            if not converted and not skip_convert:
+                _, _, src_h = await loop.run_in_executor(None, get_video_info, tmp)
+                if src_h > 1080:
+                    # Source only existed above the 1080p ceiling: resize to 1080p
+                    # (aspect preserved via scale=-2:1080, crf 20), one output file.
+                    await safe_edit(status_msg, f"⚙️ *Step 3/4: Source is {src_h}p - resizing to 1080p...*", force=True)
+                    tmp = await apply_convert(tmp, {"scale": 1080}, status_msg)
+                    converted = True
             tmp   = await compress_to_limit(tmp, status_msg)
-            await safe_edit(status_msg, "⚙️ *Step 3/4: Optimising video format...*", force=True)
-            tmp   = await loop.run_in_executor(None, remux_for_streaming, tmp)
+            if not converted and not skip_convert:
+                await safe_edit(status_msg, "⚙️ *Step 3/4: Optimising video format...*", force=True)
+                tmp   = await _remux_live(tmp, status_msg)
 
             if uid in user_thumbnails and os.path.exists(user_thumbnails[uid]):
                 thumb = user_thumbnails[uid]
@@ -2298,7 +2608,7 @@ async def _do_dl(url: str, reply_msg, chat_id: int):
 
         def run_ydl():
             ydl_opts = {
-                "format": "bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
+                "format": YDL_FORMAT,
                 "outtmpl": tmp_out,
                 "quiet": True,
                 "noplaylist": True,
@@ -2900,11 +3210,69 @@ async def help_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
         "`/flush` or `/delthumb` — clear custom thumbnail",
         "`/search [q]` — search files",
         "`/rename [name]` — rename last file",
+        "`/convert [spec]` — output format/size default (720p, mkv, mp3, 500mb, crf20 h265, off)",
+        "`/convert 720p` — reply to a video to convert that file",
         "`/status` — vault stats",
         "`/quiet` — toggle silent saves",
     ]
     if owner: lines += ["\n*Owner*", "`/session` — get Telethon session string", "`/pair` — pair the browser extension", "`/unpair` — revoke paired browsers"]
     await u.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+async def convert_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    uid = u.effective_user.id
+    toks = c.args or []
+    reply = u.message.reply_to_message
+
+    if reply and (reply.video or (reply.document and
+                                  getattr(reply.document, "mime_type", "").startswith("video/"))):
+        if not toks:
+            return await u.message.reply_text(
+                f"Reply spec needed. Default: `{describe_convert(user_convert.get(uid, {}))}`",
+                parse_mode="Markdown")
+        return await _convert_reply(reply, parse_convert_spec(toks), u)
+
+    if not toks:
+        return await u.message.reply_text(
+            f"*Converter default:* `{describe_convert(user_convert.get(uid, {}))}`\n\n"
+            "`/convert 720p` · `/convert mkv` · `/convert mp3` · `/convert 500mb` · `/convert crf20 h265` · `/convert off`\n"
+                        "Reply to a video with `/convert 720p` to convert that file.",
+            parse_mode="Markdown")
+
+    spec = parse_convert_spec(toks)
+    if spec:
+        user_convert[uid] = spec
+    else:
+        user_convert.pop(uid, None)
+    await u.message.reply_text(f"✅ Converter set to: `{describe_convert(user_convert.get(uid, {}))}`",
+                               parse_mode="Markdown")
+
+async def _convert_reply(reply_msg, spec: dict, u: Update):
+    uid = u.effective_user.id
+    if not spec:
+        return await reply_msg.reply_text("Give me a spec, e.g. `/convert 720p`", parse_mode="Markdown")
+    status = await reply_msg.reply_text(f"⚙️ *Converting ({describe_convert(spec)})...*", parse_mode="Markdown")
+    src = None
+    try:
+        tg_msg, cl = await resolve_tg_message(reply_msg.chat_id, reply_msg.message_id)
+        if tg_msg is None or tg_msg.media is None:
+            return await status.edit_text("Could not access that file.")
+        raw = (reply_msg.caption
+               or (reply_msg.video.file_name if reply_msg.video else None)
+               or (reply_msg.document.file_name if reply_msg.document else None) or "video")
+        title = clean_name(raw) or raw
+        src = await cl.download_media(tg_msg, file=os.path.join(ARIA2C_DOWNLOAD_DIR, f"conv_{uid}"))
+        if not src:
+            return await status.edit_text("Download failed.")
+        out = await apply_convert(src, spec, status)
+        await _finish_upload(out, title, status, reply_msg.chat_id, reply_msg.chat_id, skip_convert=True)
+    except Exception as e:
+        await status.edit_text(f"❌ Convert failed: {str(e)[:150]}")
+    finally:
+        if src and os.path.exists(src):
+            try: os.remove(src)
+            except Exception: pass
+
+# ── DRM COMMANDS ──────────────────────────────────────
 
 async def status_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     with get_db() as conn:
@@ -2912,7 +3280,7 @@ async def status_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
         cur.execute("SELECT COUNT(*), MAX(added_at) FROM files")
         count, latest = cur.fetchone()
     thumb_status = "✅ Custom Set" if u.effective_user.id in user_thumbnails else "Auto-generated"
-    await u.message.reply_text(f"*Vault Status*\n\nFiles: *{count}*\nLast added: {(latest or 'never')[:16]}\nUpload limit: 2 GB\nThumbnail: *{thumb_status}*", parse_mode="Markdown")
+    await u.message.reply_text(f"*Vault Status*\n\nFiles: *{count}*\nLast added: {(latest or 'never')[:16]}\nUpload limit: 2 GB\nThumbnail: *{thumb_status}*\nConverter: `{describe_convert(user_convert.get(u.effective_user.id, {}))}`", parse_mode="Markdown")
 
 async def files_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await send_vault_page(u.message, 0)
@@ -3438,6 +3806,7 @@ async def main():
         BotCommand("flush", "Flush/delete custom thumbnail"),
         BotCommand("delthumb", "Same as /flush"),
         BotCommand("mp3", "Extract MP3 from video or URL"),
+        BotCommand("convert", "Set video convert spec (720p, mkv, mp3, 500mb...)"),
         BotCommand("search", "Search files in vault"),
         BotCommand("rename", "Rename last file"),
         BotCommand("limits", "Check rate limits and status"),
@@ -3465,6 +3834,7 @@ async def main():
     app.add_handler(CommandHandler("pair",      pair_cmd))
     app.add_handler(CommandHandler("unpair",    unpair_cmd))
     app.add_handler(CommandHandler("mp3",       mp3_cmd))
+    app.add_handler(CommandHandler("convert",   convert_cmd))
     app.add_handler(CommandHandler("thumb",     thumb_cmd))
     app.add_handler(CommandHandler("viewthumb", viewthumb_cmd))
     app.add_handler(CommandHandler(["flush", "flushthumb", "delthumb"], flush_cmd))
