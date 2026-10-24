@@ -742,6 +742,9 @@ def _universal_snatch_sync(page_url: str) -> dict:
                         "page_url": page.url,
                     })
 
+            _GENERIC_CT = ("application/octet-stream", "binary/octet-stream", "text/plain")
+            _SNIFF_MAX_BYTES = 5 * 1024 * 1024  # never read bodies larger than this
+
             def on_response(resp):
                 ctype = resp.headers.get("content-type", "").lower()
                 u = resp.url
@@ -752,6 +755,43 @@ def _universal_snatch_sync(page_url: str) -> dict:
                         "url": u, "headers": hdrs,
                         "type": "hls" if ("mpegurl" in ctype or ".m3u8" in u) else ("dash" if (".mpd" in u or "dash" in ctype) else "direct"),
                         "page_url": page.url,
+                    })
+                    return
+                # Body sniffing: servers that label media with a generic content type at
+                # opaque URLs. Only small bodies are read (manifest-sized); large binary
+                # downloads are never pulled just to sniff them.
+                if ctype.split(";")[0].strip() not in _GENERIC_CT and ctype != "":
+                    return
+                u_clean = u.split("?")[0].rstrip("/").lower()
+                if any(x in u_clean for x in ("preview", "thumb", "poster", ".jpg", ".png", ".gif", "analytics", "favicon")):
+                    return
+                if any(c["url"] == u for c in media_candidates):
+                    return
+                try:
+                    cl = int(resp.headers.get("content-length", "") or 0)
+                except Exception:
+                    cl = 0
+                if not cl or cl > _SNIFF_MAX_BYTES:
+                    return
+                try:
+                    body = resp.body()
+                except Exception:
+                    return
+                if not body:
+                    return
+                head = body[:2048]
+                sniffed = None
+                if body.startswith(b"#EXTM3U"):
+                    sniffed = "hls"
+                elif head.lstrip()[:1] == b"<" and b"<MPD" in head:
+                    sniffed = "dash"
+                elif len(body) >= 12 and body[4:8] == b"ftyp" and all(32 <= b < 127 for b in body[8:12]):
+                    sniffed = "direct"
+                if sniffed:
+                    hdrs = dict(resp.request.headers)
+                    hdrs.setdefault("Referer", clean_referer(page.url))
+                    media_candidates.append({
+                        "url": u, "headers": hdrs, "type": sniffed, "page_url": page.url,
                     })
 
             page.on("request", on_request)
@@ -776,21 +816,55 @@ def _universal_snatch_sync(page_url: str) -> dict:
                         })
                 except Exception: pass
 
-            time.sleep(1.0)
-            for sel in [
-                "button.vjs-big-play-button", ".jw-display-icon-display",
-                "button[aria-label='Play']", ".play-button", "#play", "video",
-                ".fp-play", ".fp-ui", "#kt_player", ".player-holder", ".play"
-            ]:
-                try:
-                    el = page.query_selector(sel)
-                    if el:
-                        el.click(timeout=800, no_wait_after=True)
-                        time.sleep(0.8)
-                        if media_candidates: break
-                except Exception: pass
+            # Standard video metadata (og:video, twitter:player:stream, JSON-LD
+            # VideoObject contentUrl) - catches pages that declare media without a
+            # player. Only http(s) URLs with a real media extension are accepted.
+            try:
+                html_main = page.content()
+                _meta_pats = (
+                    r'''<meta[^>]+(?:property|name)=["'](?:og:video(?::url|:secure_url)?|twitter:player:stream)["'][^>]+content=["']([^"']+)["']''',
+                    r'''<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["'](?:og:video(?::url|:secure_url)?|twitter:player:stream)["']''',
+                    r'''"contentUrl"\s*:\s*"([^"]+)"''',
+                )
+                for pat in _meta_pats:
+                    for m in re.finditer(pat, html_main, re.I):
+                        raw = m.group(1).replace('\\/', '/').replace('&amp;', '&').strip()
+                        full = urljoin(page.url or page_url, raw)
+                        low = full.lower()
+                        if not low.startswith(('http://', 'https://')):
+                            continue
+                        if not any(e in low.split('?')[0] for e in ('.mp4', '.webm', '.m3u8', '.mov', '.m4v', '.mpd')):
+                            continue
+                        if any(c['url'] == full for c in media_candidates):
+                            continue
+                        media_candidates.append({
+                            'url': full,
+                            'headers': {'Referer': clean_referer(page.url or page_url), 'User-Agent': _STANDARD_UA},
+                            'type': 'hls' if '.m3u8' in low else ('dash' if '.mpd' in low else 'direct'),
+                            'page_url': page_url,
+                        })
+            except Exception: pass
 
-            for _ in range(4):
+            time.sleep(1.0)
+            # Player activation: same player-control selectors as before, but tried in
+            # every frame so players embedded in iframes start too. No generic buttons.
+            for frame in page.frames:
+                if media_candidates: break
+                for sel in [
+                    "button.vjs-big-play-button", ".jw-display-icon-display",
+                    "button[aria-label='Play']", ".play-button", "#play", "video",
+                    ".fp-play", ".fp-ui", "#kt_player", ".player-holder", ".play"
+                ]:
+                    try:
+                        el = frame.query_selector(sel)
+                        if el:
+                            el.click(timeout=800, no_wait_after=True)
+                            time.sleep(0.8)
+                            if media_candidates: break
+                    except Exception: pass
+
+            # Poll for late-loading media; still bounded by the 20s async wrapper.
+            for _ in range(14):
                 if media_candidates: break
                 time.sleep(0.8)
 
@@ -802,9 +876,12 @@ def _universal_snatch_sync(page_url: str) -> dict:
     if media_candidates:
         def _score(item):
             u = item["url"].lower()
+            t = item.get("type", "")
             if "master.m3u8" in u or "playlist.m3u8" in u or ".mpd" in u: return 100
             if ".m3u8" in u: return 80
             if ".mp4" in u or "doodcdn" in u or "/video~" in u or "/get_file/" in u: return 60
+            if t in ("hls", "dash"): return 70  # body-sniffed manifest at opaque URL
+            if t == "direct": return 50         # body-sniffed or metadata-declared media
             return 10
         media_candidates.sort(key=_score, reverse=True)
         best = media_candidates[0]
@@ -2168,19 +2245,23 @@ async def _do_dl(url: str, reply_msg, chat_id: int):
         await safe_edit(status, "🔍 *Step 1/4: Resolving stream link...*", reply_markup=CANCEL_KB, force=True)
         real_url, scraped_title, scraper_ref = await asyncio.to_thread(_scrape_real_url, url)
 
+        snatch_type = None
         if not real_url or real_url == url:
             snatch_res = await universal_snatch(url, status)
             if snatch_res and snatch_res.get("url"):
                 real_url = snatch_res["url"]
                 scraped_title = snatch_res.get("title") or scraped_title
                 scraper_ref = snatch_res.get("headers", {}).get("Referer", url)
+                snatch_type = snatch_res.get("type")
 
         clean_target_url = real_url.replace("&amp;", "&").replace("\\", "").strip()
         ref_header = clean_referer(scraper_ref or url)
 
         # 1. Direct HLS / DASH Stream routing
-        if (".m3u8" in clean_target_url or clean_target_url.split("?")[0].endswith(".m3u8") 
-            or ".mpd" in clean_target_url or "/manifest" in clean_target_url):
+        # snatch_type covers body-sniffed manifests at opaque URLs (no .m3u8/.mpd in URL)
+        if (".m3u8" in clean_target_url or clean_target_url.split("?")[0].endswith(".m3u8")
+            or ".mpd" in clean_target_url or "/manifest" in clean_target_url
+            or snatch_type in ("hls", "dash")):
             await safe_edit(status, "📥 *Step 2/4: Stream found (HLS/DASH)!*\nStarting downloader...", reply_markup=CANCEL_KB, force=True)
             await _do_dl_via_ffmpeg_hls(clean_target_url, status, cancel_flag, uid, chat_id, page_url=url, title=scraped_title, referer=ref_header)
             return
