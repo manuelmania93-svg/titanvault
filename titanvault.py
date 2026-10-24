@@ -134,6 +134,10 @@ pending_thumb:  dict = {}
 pending_mp3:    dict = {}
 dl_tasks:       dict = {}
 dl_cancel_flags: dict = {}
+link_queues:    dict = {}   # chat_id -> asyncio.Queue of pending page URLs (link worker consumes one at a time)
+link_workers:   dict = {}   # chat_id -> worker task
+pending_links:  dict = {}   # chat_id -> [urls active or queued] for duplicate detection
+LINK_RE = re.compile(r"https?://[^\s]+")
 save_queues:    dict = {}
 save_workers:   dict = {}
 user_thumbnails: dict = {}
@@ -3389,6 +3393,31 @@ async def flush_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text("🗑 Thumbnail flushed!")
 
 
+async def _link_worker(uid: int, reply_msg):
+    """Sequentially downloads every URL in link_queues[uid]. One download at a
+    time per chat; a Cancel button press clears the queue in button_handler."""
+    q = link_queues[uid]
+    try:
+        while True:
+            try:
+                url = q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            task = asyncio.create_task(_do_dl(url, reply_msg, uid))
+            dl_tasks[uid] = task
+            try:
+                await task
+            except asyncio.CancelledError:
+                break   # DL_CANCEL cancels the active task and clears the queue
+            except Exception:
+                logging.exception(f"[link_worker] download failed: {url[:80]}")
+            finally:
+                pend = pending_links.get(uid)
+                if pend and url in pend: pend.remove(url)
+    finally:
+        link_workers.pop(uid, None)
+
+
 # ══════════════════════════════════════════════════════
 #  MESSAGE DISPATCHER & BUTTON HANDLER
 # ══════════════════════════════════════════════════════
@@ -3431,17 +3460,33 @@ async def on_message(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await _do_rename(c.bot, msg, data["db_id"], msg.text.strip(), echo_chat=u.effective_chat.id)
         return
 
-    if msg.text and re.match(r"https?://", msg.text.strip()) and not getattr(msg, "forward_origin", None):
-        uid = u.effective_chat.id
-        new_url = msg.text.strip()
-        if uid in dl_tasks and not dl_tasks[uid].done():
-            active_flag = dl_cancel_flags.get(uid)
-            if active_flag and len(active_flag) > 1 and active_flag[1] == new_url: return
-            dl_tasks[uid].cancel()
-            await asyncio.sleep(0.3)
-        task = asyncio.create_task(_do_dl(new_url, msg, uid))
-        dl_tasks[uid] = task
-        return
+    if msg.text and not getattr(msg, "forward_origin", None):
+        urls = [x.rstrip(".,;!?)>") for x in LINK_RE.findall(msg.text)]
+        if urls:
+            uid = u.effective_chat.id
+            pend = pending_links.setdefault(uid, [])
+            fresh = [x for x in urls if x not in pend]
+            dupes = len(urls) - len(fresh)
+            if fresh:
+                q = link_queues.setdefault(uid, asyncio.Queue())
+                for x in fresh:
+                    pend.append(x)
+                    await q.put(x)   # unbounded queue: put() never yields, worker cannot race the enqueue
+                w = link_workers.get(uid)
+                need_worker = not w or w.done()
+                if need_worker:
+                    link_workers[uid] = asyncio.create_task(_link_worker(uid, msg))
+                queued_n = len(fresh) - (1 if need_worker else 0)
+                notes = []
+                if queued_n > 0:
+                    notes.append(f"➕ {queued_n} link{'s' if queued_n != 1 else ''} queued - one download at a time.")
+                if dupes:
+                    notes.append(f"⏭️ {dupes} duplicate{'s' if dupes != 1 else ''} skipped (already downloading or queued).")
+                if notes:
+                    await msg.reply_text("\n".join(notes))
+            elif dupes:
+                await msg.reply_text("⏭️ Already downloading or queued - duplicate skipped.")
+            return
 
     if msg.video or (msg.document and getattr(msg.document, "mime_type", "").startswith("video/")):
         if uid in user_thumbnails and os.path.exists(user_thumbnails[uid]):
@@ -3506,6 +3551,12 @@ async def button_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         uid = int(tid)
         flag = dl_cancel_flags.get(uid)
         if flag: flag[0] = True
+        q_links = link_queues.get(uid)
+        if q_links:
+            while not q_links.empty():
+                try: q_links.get_nowait()
+                except asyncio.QueueEmpty: break
+        if uid in pending_links: pending_links[uid].clear()
         task = dl_tasks.pop(uid, None)
         if task: task.cancel()
         return
