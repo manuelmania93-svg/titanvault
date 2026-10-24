@@ -724,6 +724,14 @@ def _universal_snatch_sync(page_url: str) -> dict:
                 });
             """)
 
+            def _full_headers(req):
+                # req.headers omits browser-internal headers (Origin, sec-fetch-*);
+                # all_headers() returns the complete wire set once available.
+                try:
+                    return dict(req.all_headers())
+                except Exception:
+                    return dict(req.headers)
+
             def on_request(req):
                 u = req.url
                 u_clean = u.split("?")[0].rstrip("/").lower()
@@ -734,7 +742,7 @@ def _universal_snatch_sync(page_url: str) -> dict:
                 is_direct = any(u_clean.endswith(ext) for ext in (".mp4", ".webm", ".ts", ".mkv", ".m4s")) or ("/get_file/" in u)
 
                 if is_m3u8 or is_mpd or is_direct or "voe-network.net" in u or "doodcdn" in u or "/video~" in u:
-                    hdrs = dict(req.headers)
+                    hdrs = _full_headers(req)
                     hdrs.setdefault("Referer", clean_referer(page.url))
                     media_candidates.append({
                         "url": u, "headers": hdrs,
@@ -749,7 +757,7 @@ def _universal_snatch_sync(page_url: str) -> dict:
                 ctype = resp.headers.get("content-type", "").lower()
                 u = resp.url
                 if any(x in ctype for x in ("mpegurl", "video/mp4", "video/mp2t", "application/x-mpegurl", "video/octet-stream", "dash+xml")) or "doodcdn" in u or ".mpd" in u:
-                    hdrs = dict(resp.request.headers)
+                    hdrs = _full_headers(resp.request)
                     hdrs.setdefault("Referer", clean_referer(page.url))
                     media_candidates.append({
                         "url": u, "headers": hdrs,
@@ -788,7 +796,7 @@ def _universal_snatch_sync(page_url: str) -> dict:
                 elif len(body) >= 12 and body[4:8] == b"ftyp" and all(32 <= b < 127 for b in body[8:12]):
                     sniffed = "direct"
                 if sniffed:
-                    hdrs = dict(resp.request.headers)
+                    hdrs = _full_headers(resp.request)
                     hdrs.setdefault("Referer", clean_referer(page.url))
                     media_candidates.append({
                         "url": u, "headers": hdrs, "type": sniffed, "page_url": page.url,
@@ -1459,7 +1467,7 @@ async def _do_dl_via_aria2c(url: str, out_file: str, status_msg, cancel_flag: li
                     await safe_edit(status_msg, f"📥 *Downloading via aria2c...*\n\n[{bar}] {pct}%  •  {spd}/s  ETA {eta}")
             await asyncio.sleep(0.05)
         await proc.wait()
-        return os.path.exists(out_file) and os.path.getsize(out_file) > 1024 * 1024
+        return os.path.exists(out_file) and os.path.getsize(out_file) > 0 and _probe_has_media_stream(out_file)
     except Exception as e:
         logging.warning(f"aria2c error: {e}")
         return False
@@ -1480,6 +1488,20 @@ def extract_thumb(video_path: str) -> str:
     except Exception as e:
         logging.warning("Thumb: " + str(e))
     return ""
+
+def _probe_has_media_stream(path: str) -> bool:
+    """True when ffprobe finds at least one real video or audio stream."""
+    try:
+        r = subprocess.run([
+            FFPROBE_PATH, "-v", "error",
+            "-show_entries", "stream=codec_type",
+            "-of", "json", path
+        ], capture_output=True, text=True, timeout=15)
+        kinds = [s.get("codec_type") for s in json.loads(r.stdout).get("streams", [])]
+        return "video" in kinds or "audio" in kinds
+    except Exception:
+        return False
+
 
 def remux_for_streaming(src: str) -> str:
     base, _ = os.path.splitext(src)
@@ -1710,7 +1732,7 @@ async def compress_to_limit(src: str, status_msg) -> str:
         except Exception: pass
     return src
 
-async def _do_dl_via_cffi(url: str, status_msg, cancel_flag: list, uid: int, chat_id: int, headers: dict = None, title: str = "", page_url: str = ""):
+async def _do_dl_via_cffi(url: str, status_msg, cancel_flag: list, uid: int, chat_id: int, headers: dict = None, title: str = "", page_url: str = "") -> bool:
     from curl_cffi import requests as _cr
     loop = asyncio.get_running_loop()
     t0 = time.time()
@@ -1764,16 +1786,20 @@ async def _do_dl_via_cffi(url: str, status_msg, cancel_flag: list, uid: int, cha
         progress_task.cancel()
     except Exception as e:
         await safe_edit(status_msg, f"❌ Download failed: {e}", force=True)
-        return
+        return False
 
     if cancel_flag[0] or not result_file or not os.path.exists(result_file):
         if os.path.exists(tmp_path): os.remove(tmp_path)
         await safe_edit(status_msg, "❌ Cancelled or no file saved.", force=True)
-        return
+        return False
 
-    await _finish_upload(result_file, title, status_msg, uid, chat_id)
+    return await _finish_upload(result_file, title, status_msg, uid, chat_id)
 
-async def _do_dl_via_ffmpeg_hls(url: str, status_msg, cancel_flag: list, uid: int, chat_id: int, page_url: str = "", title: str = "", referer: str = ""):
+async def _do_dl_via_ffmpeg_hls(url: str, status_msg, cancel_flag: list, uid: int, chat_id: int, page_url: str = "", title: str = "", referer: str = "", extra_headers: dict = None) -> bool:
+    _canon = {"user-agent": "User-Agent", "referer": "Referer", "origin": "Origin",
+              "accept": "Accept", "accept-language": "Accept-Language"}
+    extra_headers = {_canon[str(k).lower()]: re.sub(r"[\r\n]", "", str(v)).strip()[:500]
+                     for k, v in (extra_headers or {}).items() if str(k).lower() in _canon}
     clean_url = url.replace("&amp;", "&").replace("\\", "").strip()
     _referer = clean_referer(referer or page_url or clean_url)
     base_referer = f"{urlparse(_referer).scheme}://{urlparse(_referer).netloc}/"
@@ -1806,6 +1832,7 @@ async def _do_dl_via_ffmpeg_hls(url: str, status_msg, cancel_flag: list, uid: in
             "Accept-Language": _STANDARD_LANG,
             "Referer": clean_referer(ref_to_use),
         }
+        headers_dict.update(extra_headers)  # allowlisted sniffer headers win
         ydl_opts = {
             "format": "bestvideo+bestaudio/best",
             "outtmpl": ydl_out,
@@ -1823,9 +1850,8 @@ async def _do_dl_via_ffmpeg_hls(url: str, status_msg, cancel_flag: list, uid: in
     for active_ref in [_referer, base_referer]:
         try:
             await loop.run_in_executor(None, lambda r=active_ref: _run_ytdl_hls(r))
-            if os.path.exists(ydl_out) and os.path.getsize(ydl_out) > 1024 * 1024:
-                await _finish_upload(ydl_out, _safe_title, status_msg, uid, chat_id)
-                return
+            if os.path.exists(ydl_out) and _probe_has_media_stream(ydl_out):
+                return await _finish_upload(ydl_out, _safe_title, status_msg, uid, chat_id)
         except Exception:
             if os.path.exists(ydl_out):
                 try: os.remove(ydl_out)
@@ -1834,6 +1860,8 @@ async def _do_dl_via_ffmpeg_hls(url: str, status_msg, cancel_flag: list, uid: in
     # FFmpeg fallback with stream repair & resilience flags
     await safe_edit(status_msg, "⚡ *Retrying stream via FFmpeg core...*", force=True)
     header_str = f"User-Agent: {_STANDARD_UA}\r\nAccept-Language: {_STANDARD_LANG}\r\nReferer: {_referer}\r\n"
+    for _hk, _hv in extra_headers.items():
+        header_str += f"{_hk}: {_hv}\r\n"
     ff_cmd = [
         FFMPEG_PATH, "-y",
         "-protocol_whitelist", "file,http,https,tcp,tls,crypto,data",
@@ -1849,15 +1877,14 @@ async def _do_dl_via_ffmpeg_hls(url: str, status_msg, cancel_flag: list, uid: in
     try:
         proc = await asyncio.create_subprocess_exec(*ff_cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
         await proc.wait()
-        if os.path.exists(ydl_out) and os.path.getsize(ydl_out) > 1024 * 1024:
-            await _finish_upload(ydl_out, _safe_title, status_msg, uid, chat_id)
-            return
+        if os.path.exists(ydl_out) and _probe_has_media_stream(ydl_out):
+            return await _finish_upload(ydl_out, _safe_title, status_msg, uid, chat_id)
     except Exception as e:
         logging.warning(f"[FFmpeg core error]: {e}")
 
-    await safe_edit(status_msg, "❌ Stream host rejected download (HTTP 403 / token expired).", force=True)
+    return False
 
-async def _finish_upload(file_path: str, title: str, status_msg, uid: int, chat_id: int):
+async def _finish_upload(file_path: str, title: str, status_msg, uid: int, chat_id: int) -> bool:
     loop  = asyncio.get_running_loop()
     t0    = time.time()
     last  = [0.0]
@@ -1867,6 +1894,15 @@ async def _finish_upload(file_path: str, title: str, status_msg, uid: int, chat_
     thumb = ""
     tmp   = file_path
     uploaded = False   # SAFETY: the original is only deleted after Telegram confirmed the upload
+    media_exts = (".mp4", ".mkv", ".webm", ".mov", ".avi", ".ts", ".flv", ".m4v",
+                  ".mp3", ".m4a", ".aac", ".opus", ".ogg", ".wav", ".flac")
+    if ext in media_exts and not _probe_has_media_stream(file_path):
+        # Server delivered a non-media payload (error page etc.) under a media name.
+        logging.warning(f"[finish_upload] rejected non-media payload: {os.path.basename(file_path)}")
+        await safe_edit(status_msg, "❌ The site did not deliver a playable media file (likely an error page or expired link).", force=True)
+        try: os.remove(file_path)
+        except Exception: pass
+        return False
     try:
         if is_video:
             tmp   = await compress_to_limit(tmp, status_msg)
@@ -1922,7 +1958,7 @@ async def _finish_upload(file_path: str, title: str, status_msg, uid: int, chat_
 
         if not sent:
             await safe_edit(status_msg, f"❌ Upload failed due to persistent Telegram rate limits.\nYour download was kept: `{os.path.basename(file_path)}`", force=True)
-            return
+            return False
 
         with get_db() as conn:
             cur = conn.cursor()
@@ -1966,6 +2002,7 @@ async def _finish_upload(file_path: str, title: str, status_msg, uid: int, chat_
                         parse_mode="Markdown", reply_markup=_kept_kb(rid))
             except Exception as _e:
                 logging.warning(f"Could not register kept file: {type(_e).__name__}")
+    return uploaded
 
 # ══════════════════════════════════════════════════════
 #  LOG-SAFE URLS (never log query strings / tokens)
@@ -2246,6 +2283,7 @@ async def _do_dl(url: str, reply_msg, chat_id: int):
         real_url, scraped_title, scraper_ref = await asyncio.to_thread(_scrape_real_url, url)
 
         snatch_type = None
+        snatch_hdrs = None
         if not real_url or real_url == url:
             snatch_res = await universal_snatch(url, status)
             if snatch_res and snatch_res.get("url"):
@@ -2253,45 +2291,10 @@ async def _do_dl(url: str, reply_msg, chat_id: int):
                 scraped_title = snatch_res.get("title") or scraped_title
                 scraper_ref = snatch_res.get("headers", {}).get("Referer", url)
                 snatch_type = snatch_res.get("type")
+                snatch_hdrs = snatch_res.get("headers")
 
         clean_target_url = real_url.replace("&amp;", "&").replace("\\", "").strip()
         ref_header = clean_referer(scraper_ref or url)
-
-        # 1. Direct HLS / DASH Stream routing
-        # snatch_type covers body-sniffed manifests at opaque URLs (no .m3u8/.mpd in URL)
-        if (".m3u8" in clean_target_url or clean_target_url.split("?")[0].endswith(".m3u8")
-            or ".mpd" in clean_target_url or "/manifest" in clean_target_url
-            or snatch_type in ("hls", "dash")):
-            await safe_edit(status, "📥 *Step 2/4: Stream found (HLS/DASH)!*\nStarting downloader...", reply_markup=CANCEL_KB, force=True)
-            await _do_dl_via_ffmpeg_hls(clean_target_url, status, cancel_flag, uid, chat_id, page_url=url, title=scraped_title, referer=ref_header)
-            return
-
-        # 2. Check if a real CDN / video link was resolved
-        is_dood = ("doodcdn" in clean_target_url) or ("/video~" in clean_target_url) or ("pass_md5" in clean_target_url)
-        path_ext = detect_direct_video_ext(clean_target_url)
-        is_resolved_stream = (clean_target_url != url) and not any(clean_target_url.split("?")[0].endswith(ext) for ext in (".html", ".htm", ".php"))
-
-        if is_dood or path_ext or is_resolved_stream:
-            direct_hdrs = build_direct_headers(clean_target_url, ref_header, _STANDARD_UA)
-            await safe_edit(status, "📥 *Step 2/4: Direct video stream detected (downloading)...*", reply_markup=CANCEL_KB, force=True)
-            if is_dood:
-                await _do_dl_via_cffi(clean_target_url, status, cancel_flag, uid, chat_id, headers=direct_hdrs, title=scraped_title, page_url=ref_header)
-                return
-            ok = await _do_dl_via_aria2c(clean_target_url, tmp_out, status, cancel_flag, headers=direct_hdrs)
-            if ok:
-                await _finish_upload(tmp_out, scraped_title or clean_name(os.path.basename(clean_target_url.rstrip("/"))), status, uid, chat_id)
-                return
-            await _do_dl_via_cffi(clean_target_url, status, cancel_flag, uid, chat_id, headers=direct_hdrs, title=scraped_title, page_url=ref_header)
-            return
-
-        if clean_target_url == url:
-            if await _do_dl_via_jdownloader(url, status, cancel_flag, uid, chat_id, title=scraped_title):
-                return
-            await safe_edit(status, "❌ Could not extract video stream from this URL (unsupported or protected site).", force=True)
-            return
-
-        # Native yt-dlp core for standard platforms
-        await safe_edit(status, "📥 *Step 2/4: Starting video downloader...*", reply_markup=CANCEL_KB, force=True)
 
         def run_ydl():
             ydl_opts = {
@@ -2323,21 +2326,72 @@ async def _do_dl(url: str, reply_msg, chat_id: int):
                 meta["height"] = info.get("height", 0)
                 return info
 
-        try:
-            await loop.run_in_executor(None, run_ydl)
-        except Exception as e:
-            if cancel_flag[0] or "__CANCELLED__" in str(e): raise
-            if clean_target_url != url and detect_direct_video_ext(clean_target_url):
-                await _do_dl_via_cffi(clean_target_url, status, cancel_flag, uid, chat_id, title=scraped_title, page_url=url)
-                return
-            else:
-                if await _do_dl_via_jdownloader(url, status, cancel_flag, uid, chat_id, title=scraped_title):
-                    return
-                await safe_edit(status, "❌ Could not download video from this URL.", force=True)
-                return
+        async def _try_native_ytdlp() -> bool:
+            await safe_edit(status, "📥 *Step 2/4: Starting video downloader...*", reply_markup=CANCEL_KB, force=True)
+            try:
+                await loop.run_in_executor(None, run_ydl)
+            except Exception as e:
+                if cancel_flag[0] or "__CANCELLED__" in str(e): raise
+                if clean_target_url != url and detect_direct_video_ext(clean_target_url):
+                    return await _do_dl_via_cffi(clean_target_url, status, cancel_flag, uid, chat_id, title=scraped_title, page_url=url)
+                return False
+            final_title = meta.get("title") or scraped_title or "Video"
+            return await _finish_upload(tmp_out, final_title, status, uid, chat_id)
 
-        final_title = meta.get("title") or scraped_title or "Video"
-        await _finish_upload(tmp_out, final_title, status, uid, chat_id)
+        async def _last_resorts() -> bool:
+            """A resolved stream failed: try yt-dlp native on the original page, then JDownloader."""
+            if await _try_native_ytdlp():
+                return True
+            if await _do_dl_via_jdownloader(url, status, cancel_flag, uid, chat_id, title=scraped_title):
+                return True
+            await safe_edit(status, "❌ Could not download the detected stream (host error, expired link, or unsupported site).", force=True)
+            return False
+
+        # 1. Direct HLS / DASH Stream routing
+        # snatch_type covers body-sniffed manifests at opaque URLs (no .m3u8/.mpd in URL)
+        if (".m3u8" in clean_target_url or clean_target_url.split("?")[0].endswith(".m3u8")
+            or ".mpd" in clean_target_url or "/manifest" in clean_target_url
+            or snatch_type in ("hls", "dash")):
+            await safe_edit(status, "📥 *Step 2/4: Stream found (HLS/DASH)!*\nStarting downloader...", reply_markup=CANCEL_KB, force=True)
+            ok = await _do_dl_via_ffmpeg_hls(clean_target_url, status, cancel_flag, uid, chat_id, page_url=url, title=scraped_title, referer=ref_header, extra_headers=snatch_hdrs)
+            if ok: return
+            await _last_resorts()
+            return
+
+        # 2. Check if a real CDN / video link was resolved
+        is_dood = ("doodcdn" in clean_target_url) or ("/video~" in clean_target_url) or ("pass_md5" in clean_target_url)
+        path_ext = detect_direct_video_ext(clean_target_url)
+        is_resolved_stream = (clean_target_url != url) and not any(clean_target_url.split("?")[0].endswith(ext) for ext in (".html", ".htm", ".php"))
+
+        if is_dood or path_ext or is_resolved_stream:
+            direct_hdrs = build_direct_headers(clean_target_url, ref_header, _STANDARD_UA)
+            await safe_edit(status, "📥 *Step 2/4: Direct video stream detected (downloading)...*", reply_markup=CANCEL_KB, force=True)
+            if is_dood:
+                if await _do_dl_via_cffi(clean_target_url, status, cancel_flag, uid, chat_id, headers=direct_hdrs, title=scraped_title, page_url=ref_header):
+                    return
+                await _last_resorts()
+                return
+            ok = await _do_dl_via_aria2c(clean_target_url, tmp_out, status, cancel_flag, headers=direct_hdrs)
+            if ok and await _finish_upload(tmp_out, scraped_title or clean_name(os.path.basename(clean_target_url.rstrip("/"))), status, uid, chat_id):
+                return
+            if await _do_dl_via_cffi(clean_target_url, status, cancel_flag, uid, chat_id, headers=direct_hdrs, title=scraped_title, page_url=ref_header):
+                return
+            await _last_resorts()
+            return
+
+        if clean_target_url == url:
+            if await _do_dl_via_jdownloader(url, status, cancel_flag, uid, chat_id, title=scraped_title):
+                return
+            await safe_edit(status, "❌ Could not extract video stream from this URL (unsupported or protected site).", force=True)
+            return
+
+        # Native yt-dlp core for standard platforms
+        if await _try_native_ytdlp():
+            return
+        if await _do_dl_via_jdownloader(url, status, cancel_flag, uid, chat_id, title=scraped_title):
+            return
+        await safe_edit(status, "❌ Could not download video from this URL.", force=True)
+        return
 
     except asyncio.CancelledError:
         await safe_edit(status, "⛔ Cancelled.", force=True)
