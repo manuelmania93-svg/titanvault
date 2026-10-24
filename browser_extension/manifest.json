@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "TitanVault Handoff",
+  "version": "0.1.0",
+  "description": "Detect video streams on the current tab and send the one you pick to your own TitanVault bot (127.0.0.1 only).",
+  "permissions": ["webRequest", "storage", "tabs"],
+  "host_permissions": ["http://127.0.0.1:8765/*"],
+  "optional_host_permissions": ["http://*/*", "https://*/*"],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_popup": "popup.html", "default_title": "TitanVault" }
+}
