@@ -1,0 +1,2709 @@
+# ======================================================
+#              TITAN VAULT  --  Combined                
+#  Scrapers    -> SerienStream, VOE, Lulu, Dood, KVS, etc
+#  aria2c      -> Direct file & CDN acceleration        
+#  yt-dlp      -> Video platforms & encrypted HLS/DASH  
+#  Telethon    -> 8-worker parallel upload up to 2 GB   
+#  Batch Queue -> Auto-Name & Footprint for 200+ Ep     
+#  Media Engine-> Thumbnails, MP3, Remux & Compression  
+# ======================================================
+
+import logging
+import sqlite3
+import os
+import re
+import time
+import math
+import struct
+import random
+import string
+import asyncio
+import subprocess
+import base64
+import json
+from urllib.parse import urlparse, urljoin, parse_qs, unquote
+import yt_dlp
+import requests
+
+from PIL import Image
+from colorama import Fore, Style, init
+
+# ── python-telegram-bot ───────────────────────────────
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram.error import RetryAfter, TimedOut, NetworkError
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    CallbackQueryHandler, filters, ContextTypes,
+)
+
+# ── Telethon ──────────────────────────────────────────
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+from telethon.tl.types import (
+    DocumentAttributeVideo, DocumentAttributeFilename,
+    InputFileBig, InputFile
+)
+from telethon.tl.functions.upload import SaveBigFilePartRequest, SaveFilePartRequest
+from telethon.errors import FloodWaitError
+
+# ══════════════════════════════════════════════════════
+#  CONFIG
+# ══════════════════════════════════════════════════════
+BOT_TOKEN          = os.getenv("BOT_TOKEN", "")
+API_ID             = int(os.getenv("API_ID", ""))
+API_HASH           = os.getenv("API_HASH", "")
+SESSION_STRING     = os.getenv("SESSION_STRING", "=")
+STORAGE_CHANNEL_ID = int(os.getenv("STORAGE_CHANNEL_ID", "-"))
+OWNER_ID           = int(os.getenv("OWNER_ID", ""))
+
+FILES_PER_PAGE     = 10
+FFMPEG_PATH        = "ffmpeg"
+FFPROBE_PATH       = "ffprobe"
+FFPROBE_TIMEOUT    = 10
+MAX_UPLOAD_BYTES   = 2 * 1024 * 1024 * 1024   # 2 GB
+TELETHON_UPLOAD_WORKERS = 8
+SILENT_MODE        = [True]
+
+ARIA2C_PATH         = "aria2c"
+ARIA2C_DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", r"C:\Users\ManuelMania\Downloads\aria2c")
+os.makedirs(ARIA2C_DOWNLOAD_DIR, exist_ok=True)
+
+MAX_PARALLEL_DOWNLOADS = 3
+DOWNLOAD_QUEUE_WORKERS = 2
+
+MAX_RETRIES       = 3
+RETRY_BASE_DELAY  = 1.0
+RETRY_MAX_DELAY   = 30.0
+
+_STANDARD_UA   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+_STANDARD_LANG = "en-US,en;q=0.9"
+
+_SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
+URL_CACHE_TTL  = 86400
+URL_CACHE_FILE = os.path.join(_SCRIPT_DIR, "url_cache.json")
+COOKIES_FILE   = os.path.join(_SCRIPT_DIR, "cookies.txt")
+COOKIES_FILE   = COOKIES_FILE if os.path.isfile(COOKIES_FILE) else None
+
+# ══════════════════════════════════════════════════════
+#  INIT & STATE
+# ══════════════════════════════════════════════════════
+init(autoreset=True)
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+    force=True,
+)
+
+_session = StringSession(SESSION_STRING) if SESSION_STRING else "vault"
+tgclient = TelegramClient(
+    _session, API_ID, API_HASH,
+    device_model="Desktop",
+    system_version="Windows 10",
+    app_version="1.0",
+    connection_retries=5,
+)
+
+tgbot = TelegramClient(StringSession(), API_ID, API_HASH)
+
+pending_rename: dict = {}
+pending_thumb:  dict = {}
+pending_mp3:    dict = {}
+dl_tasks:       dict = {}
+dl_cancel_flags: dict = {}
+save_queues:    dict = {}
+save_workers:   dict = {}
+user_thumbnails: dict = {}
+
+batch_queues: dict = {}
+user_series_prefix: dict = {}
+episode_counters: dict = {}
+
+download_queue: asyncio.Queue = None
+active_downloads: dict = {}
+url_cache: dict = {}
+retry_counts: dict = {}
+
+_last_edit_times = {}
+_flood_wait_until = [0.0]
+_user_flood_until = [0.0]
+
+VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".avi", ".mov", ".ts", ".m4v", ".flv", ".m4s")
+
+
+# ══════════════════════════════════════════════════════
+#  DATABASE
+# ══════════════════════════════════════════════════════
+def init_db():
+    conn = sqlite3.connect("vault.db")
+    c = conn.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS files (
+        id       INTEGER PRIMARY KEY AUTOINCREMENT,
+        msg_id   INTEGER,
+        name     TEXT,
+        added_at TEXT DEFAULT (datetime('now'))
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS file_footprints (
+        id        INTEGER PRIMARY KEY AUTOINCREMENT,
+        file_size INTEGER,
+        duration  INTEGER,
+        name      TEXT
+    )""")
+    conn.commit()
+    conn.close()
+
+def get_db():
+    return sqlite3.connect("vault.db")
+
+def is_owner(uid: int) -> bool:
+    return uid == OWNER_ID
+
+
+# ══════════════════════════════════════════════════════
+#  HELPERS & SMART MESSAGE EDITOR
+# ══════════════════════════════════════════════════════
+async def resolve_tg_message(chat_id: int, message_id: int):
+    for cl in (tgclient, tgbot):
+        try:
+            m = await cl.get_messages(chat_id, ids=message_id)
+            if m and m.media:
+                return m, cl
+        except Exception:
+            pass
+    return None, tgclient
+
+def clean_name(text: str) -> str:
+    if not text: return ""
+    t = re.sub(
+        r"(\[.*?\]|\(.*?\)|1080p|720p|2160p|4k|h265|hevc|x264|x265|mp4|mkv|avi|https?\S+)",
+        "", text, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", t).replace(".", " ").strip()
+
+def fmt_size(b: int) -> str:
+    if b >= 1_073_741_824: return f"{b/1_073_741_824:.1f} GB"
+    if b >= 1_048_576:     return f"{b/1_048_576:.1f} MB"
+    return f"{b/1024:.0f} KB"
+
+def progress_bar(done: int, total: int, width: int = 16) -> str:
+    if total <= 0: return "[" + "░" * width + "] ?"
+    pct    = min(1.0, done / total)
+    filled = int(width * pct)
+    bar    = "▓" * filled + "░" * (width - filled)
+    return f"[{bar}] {int(pct*100)}%  {done/1_048_576:.1f}/{total/1_048_576:.1f} MB"
+
+def speed_eta(done: int, total: int, elapsed: float) -> str:
+    if elapsed < 0.5 or done == 0: return ""
+    spd = done / elapsed
+    eta = (total - done) / spd if (spd and total > done) else 0
+    s   = f"{spd/1_048_576:.1f} MB/s" if spd > 1_048_576 else f"{spd/1024:.0f} KB/s"
+    return f"  {s}  ETA {int(eta)}s"
+
+def prepare_telegram_thumb(image_path: str) -> str:
+    if not image_path or not os.path.exists(image_path):
+        return ""
+    out_path = os.path.splitext(image_path)[0] + "_tgthumb.jpg"
+    try:
+        with Image.open(image_path) as im:
+            im = im.convert("RGB")
+            im.thumbnail((320, 320))
+            im.save(out_path, "JPEG", quality=85, optimize=True)
+            if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                return out_path
+    except Exception:
+        try:
+            cmd = [
+                FFMPEG_PATH, "-y", "-i", image_path,
+                "-vf", "scale='min(320,iw)':'min(320,ih)':force_original_aspect_ratio=decrease",
+                "-q:v", "2", out_path
+            ]
+            subprocess.run(cmd, capture_output=True, timeout=15)
+            if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                return out_path
+        except Exception:
+            pass
+    return image_path
+
+async def safe_edit(msg, text: str, reply_markup=None, parse_mode="Markdown", force: bool = False):
+    now = time.time()
+    if now < _flood_wait_until[0] and not force:
+        return
+
+    msg_id = getattr(msg, "message_id", None) or id(msg)
+    last_time = _last_edit_times.get(msg_id, 0.0)
+
+    if not force and (now - last_time < 2.0):
+        return
+
+    _last_edit_times[msg_id] = now
+    try:
+        await msg.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+    except RetryAfter as e:
+        _flood_wait_until[0] = time.time() + e.retry_after
+    except (NetworkError, TimedOut):
+        pass
+    except Exception:
+        try:
+            await msg.edit_text(text, reply_markup=reply_markup, parse_mode=None)
+        except Exception:
+            pass
+
+async def safe_copy(bot, to_chat_id: int, from_chat_id: int, message_id: int, **kwargs):
+    for attempt in range(4):
+        try:
+            return await bot.copy_message(
+                chat_id=to_chat_id,
+                from_chat_id=from_chat_id,
+                message_id=message_id,
+                **kwargs,
+            )
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after + 0.5)
+        except (TimedOut, NetworkError):
+            await asyncio.sleep(2)
+        except Exception as e:
+            logging.warning(f"safe_copy error: {e}")
+            break
+    return None
+
+def detect_direct_video_ext(url: str):
+    parsed = urlparse(url)
+    clean_path = unquote(parsed.path).rstrip("/")
+
+    # KVS /get_file/ detection
+    if "/get_file/" in url.lower():
+        return ".mp4"
+
+    # Standard path extension
+    ext = os.path.splitext(clean_path)[1].lower()
+    if ext in VIDEO_EXTS:
+        return ext
+
+    # Query string parameter values
+    for values in parse_qs(parsed.query).values():
+        for v in values:
+            candidate = os.path.splitext(unquote(v).split("#")[0].rstrip("/"))[1].lower()
+            if candidate in VIDEO_EXTS:
+                return candidate
+
+    # Anywhere in decoded URL
+    low = unquote(url).lower()
+    for e in VIDEO_EXTS:
+        if (e + "&") in low or (e + "?") in low or (e + "/") in low or low.endswith(e) or (e + "=") in low:
+            return e
+
+    return None
+
+def clean_referer(ref_url: str) -> str:
+    """Strips tracking queries and fragments from Referer headers to avoid CDN 403 errors."""
+    if not ref_url: return ""
+    p = urlparse(ref_url)
+    return f"{p.scheme}://{p.netloc}{p.path}"
+
+def build_direct_headers(target_url: str, referer: str, ua: str) -> dict:
+    ref = clean_referer(referer) or target_url
+    p = urlparse(ref)
+    hdrs = {"User-Agent": ua, "Referer": ref}
+    if p.scheme and p.netloc:
+        hdrs["Origin"] = f"{p.scheme}://{p.netloc}"
+    return hdrs
+
+
+# ══════════════════════════════════════════════════════
+#  HIGH-SPEED PARALLEL UPLOADER (8 WORKERS)
+# ══════════════════════════════════════════════════════
+async def fast_upload(client, file_path, progress_callback=None):
+    file_size = os.path.getsize(file_path)
+    part_size = 512 * 1024
+    part_count = math.ceil(file_size / part_size)
+    is_big = file_size > 10 * 1024 * 1024
+    file_id = struct.unpack('q', os.urandom(8))[0]
+
+    queue = asyncio.Queue()
+    for i in range(part_count):
+        await queue.put(i)
+
+    uploaded_bytes = [0]
+    lock = asyncio.Lock()
+
+    async def worker():
+        with open(file_path, "rb") as f:
+            while not queue.empty():
+                try:
+                    part_idx = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+
+                f.seek(part_idx * part_size)
+                chunk = f.read(part_size)
+
+                req = (SaveBigFilePartRequest(file_id, part_idx, part_count, chunk)
+                       if is_big else
+                       SaveFilePartRequest(file_id, part_idx, chunk))
+
+                success = False
+                for attempt in range(3):
+                    try:
+                        await client(req)
+                        success = True
+                        break
+                    except FloodWaitError as fe:
+                        await asyncio.sleep(fe.seconds)
+                    except Exception:
+                        await asyncio.sleep(0.5)
+
+                if not success:
+                    raise RuntimeError(f"Failed to upload part {part_idx} to Telegram.")
+
+                async with lock:
+                    uploaded_bytes[0] += len(chunk)
+                    cur_bytes = uploaded_bytes[0]
+
+                if progress_callback:
+                    res = progress_callback(cur_bytes, file_size)
+                    if asyncio.iscoroutine(res):
+                        await res
+                queue.task_done()
+
+    workers = [asyncio.create_task(worker()) for _ in range(TELETHON_UPLOAD_WORKERS)]
+    await asyncio.gather(*workers)
+
+    file_name = os.path.basename(file_path)
+    if is_big:
+        return InputFileBig(file_id, part_count, file_name)
+    return InputFile(file_id, part_count, file_name, "")
+
+
+# ══════════════════════════════════════════════════════
+#  PLAYWRIGHT & REQUEST HELPERS
+# ══════════════════════════════════════════════════════
+def _sync_launch_chrome(p, headless: bool = True):
+    args = [
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-blink-features=AutomationControlled",
+    ]
+    browser = p.chromium.launch(headless=headless, timeout=10000, args=args)
+    context = browser.new_context(
+        user_agent=_STANDARD_UA,
+        viewport={"width": 1280, "height": 720},
+        locale="en-US"
+    )
+    return browser, context
+
+def _cf_get(url: str, referer: str = "", timeout: int = 15):
+    try:
+        from curl_cffi import requests as _cr
+        parsed = urlparse(url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        headers = {
+            "User-Agent": _STANDARD_UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": _STANDARD_LANG,
+            "Referer": clean_referer(referer) or (origin + "/"),
+            "Origin": origin,
+        }
+        return _cr.get(url, impersonate="chrome124", headers=headers, timeout=timeout)
+    except Exception:
+        headers = {"User-Agent": _STANDARD_UA, "Referer": clean_referer(referer) or url}
+        return requests.get(url, headers=headers, timeout=timeout)
+
+def _scrape_with_playwright(url: str, timeout: int = 20) -> str:
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser, context = _sync_launch_chrome(p, headless=True)
+            page = context.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout*1000)
+            html = page.content()
+            context.close(); browser.close()
+            return html
+    except Exception as e:
+        logging.warning(f"[playwright] failed: {e}")
+        return ""
+
+def _unpack_js(packed: str) -> str:
+    try:
+        m = re.search(r"\}\s*\(\s*'((?:[^'\\]|\\.)*)',\s*(\d+),\s*(\d+),\s*'((?:[^'\\]|\\.)*)'\s*\.split\(", packed, re.S)
+        if not m: return ""
+        payload = m.group(1).replace("\\'", "'").replace("\\\\", "\\")
+        radix   = int(m.group(2))
+        words   = m.group(4).split("|")
+        def decode_base(s, r):
+            chars = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            val = 0
+            for c in s: val = val * r + chars.index(c)
+            return val
+        def replace_word(m2):
+            word = m2.group(0)
+            try:
+                idx = decode_base(word, radix)
+                return words[idx] if idx < len(words) and words[idx] else word
+            except Exception: return word
+        return re.sub(r'\b\w+\b', replace_word, payload)
+    except Exception: return ""
+
+def decode_js_escapes(text: str) -> str:
+    """Decodes hex (\\x68) and unicode (\\u0068) escape sequences often used to hide stream links."""
+    if not text or ("\\x" not in text and "\\u" not in text):
+        return text
+    try:
+        text = re.sub(r'\\x([0-9a-fA-F]{2})', lambda m: chr(int(m.group(1), 16)), text)
+        text = re.sub(r'\\u([0-9a-fA-F]{4})', lambda m: chr(int(m.group(1), 16)), text)
+    except Exception:
+        pass
+    return text
+
+def _extract_title_from_html(html: str, fallback: str = "") -> str:
+    if not html or len(html) < 50: return fallback
+    for pat in [
+        r'<h1[^>]*>([^<]{3,150})</h1>',
+        r'"title"\s*:\s*"([^"]{3,150})"',
+        r'title\s*:\s*["\']([^"\']{3,150})["\']',
+        r'data-title=["\']([^"\']{3,150})["\']',
+    ]:
+        m = re.search(pat, html, re.I)
+        if m and m.group(1).lower() not in ("undefined", "null", "video", "player"):
+            return m.group(1).strip()
+    m = re.search(r'<title[^>]*>([^<]{3,200})</title>', html, re.I)
+    return m.group(1).strip() if m else fallback
+
+def _parse_netscape_cookies(cookie_file):
+    cookies = []
+    try:
+        with open(cookie_file, "r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#"): continue
+                parts = line.split("\t")
+                if len(parts) < 7: continue
+                domain, _, path, secure, expires, name, value = parts[:7]
+                cookies.append({
+                    "name": name, "value": value,
+                    "domain": domain.lstrip("."), "path": path,
+                    "secure": secure.upper() == "TRUE", "sameSite": "None",
+                })
+    except Exception: pass
+    return cookies
+
+
+# ── SHORTLINK & REDIRECT UNROLLER ─────────────────────
+def unroll_shortener(url: str) -> str:
+    """Follows HTTP 301/302 redirects to resolve the final destination URL."""
+    SHORTENER_DOMAINS = ("bit.ly", "tinyurl.com", "t.co", "is.gd", "buff.ly", "goo.gl", "ow.ly", "cutt.ly")
+    try:
+        domain = urlparse(url).netloc.lower().removeprefix("www.")
+        if any(domain == d for d in SHORTENER_DOMAINS) or "/redirect" in url or "/go/" in url:
+            resp = requests.head(url, allow_redirects=True, timeout=5, headers={"User-Agent": _STANDARD_UA})
+            if resp.url and resp.url != url:
+                return resp.url
+    except Exception:
+        pass
+    return url
+
+
+# ── AUTOMATIC BASE64 & PARAMETER UNPACKER ─────────────
+def unwrap_redirect_parameters(target_url: str) -> str:
+    """Automatically unpacks hidden links inside redirect parameters or Base64 strings."""
+    try:
+        parsed = urlparse(target_url)
+        qs = parse_qs(parsed.query)
+
+        for param_vals in qs.values():
+            for val in param_vals:
+                if val.startswith("http://") or val.startswith("https://"):
+                    return val
+                try:
+                    padded = val + "=" * ((4 - len(val) % 4) % 4)
+                    decoded = base64.b64decode(padded).decode("utf-8", errors="ignore").strip()
+                    if decoded.startswith("http://") or decoded.startswith("https://"):
+                        return decoded
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return target_url
+
+
+# ── METADATA & SCHEMA SNIFFER (NO EMBED URLs) ─────────
+def _scrape_schema_and_og(html: str, page_url: str) -> tuple[str, str]:
+    """Extracts direct media links from OpenGraph, Twitter Cards, and JSON-LD schemas."""
+    if not html: return "", ""
+    title = _extract_title_from_html(html)
+
+    og_pats = [
+        r'<meta[^>]+property=["\']og:video(?::url|:secure_url)?["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:video(?::url|:secure_url)?["\']',
+        r'<meta[^>]+name=["\']twitter:player:stream["\'][^>]+content=["\']([^"\']+)["\']',
+    ]
+    for pat in og_pats:
+        m = re.search(pat, html, re.I)
+        if m:
+            candidate = urljoin(page_url, m.group(1).replace("&amp;", "&").strip())
+            if any(ext in candidate.lower() for ext in (".mp4", ".m3u8", ".webm", ".ts", "/get_file/")):
+                if "/embed" not in candidate.lower():
+                    return candidate, title
+
+    for m in re.finditer(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html, re.I | re.S):
+        try:
+            data = json.loads(m.group(1).strip())
+            items = data if isinstance(data, list) else [data]
+            for it in items:
+                content_url = it.get("contentUrl")
+                if content_url and isinstance(content_url, str) and content_url.startswith("http"):
+                    if any(ext in content_url.lower() for ext in (".mp4", ".m3u8", ".webm", ".ts", "/get_file/")):
+                        return content_url, it.get("name") or title
+        except Exception:
+            pass
+
+    return "", title
+
+
+# ══════════════════════════════════════════════════════
+#  KVS, FLASHVARS & UNIVERSAL EMBED SCRAPERS
+# ══════════════════════════════════════════════════════
+def _scrape_kvs_and_html5(html: str, page_url: str) -> tuple[str, str]:
+    if not html: return "", ""
+    title = _extract_title_from_html(html)
+    candidates = []
+
+    kvs_pats = [
+        r'''video_alt_url(?:[2-9]|\d{2,})?\s*:\s*['"]((?:function/\d+/)?(?:https?://|/)[^'"]+)['"]''',
+        r'''video_url\s*:\s*['"]((?:function/\d+/)?(?:https?://|/)[^'"]+)['"]''',
+        r'''['"]((?:https?://|/)[^'"]*?/get_file/[^'"]+)['"]''',
+    ]
+
+    for pat in kvs_pats:
+        for m in re.finditer(pat, html, re.I):
+            raw = m.group(1).replace('\\/', '/').replace('&amp;', '&').strip()
+            clean = re.sub(r'^function/\d+/', '', raw)
+            if clean:
+                full = urljoin(page_url, clean)
+                if full not in candidates:
+                    candidates.append(full)
+
+    for tag_pat in [
+        r'''<source[^>]+src=['"]([^'"]+)['"]''',
+        r'''<video[^>]+src=['"]([^'"]+)['"]''',
+    ]:
+        for m in re.finditer(tag_pat, html, re.I):
+            src = m.group(1).replace('&amp;', '&').strip()
+            if any(ext in src.lower() for ext in ('.mp4', '.m3u8', '.webm', '/get_file/')):
+                full = urljoin(page_url, src)
+                if full not in candidates:
+                    candidates.append(full)
+
+    if candidates:
+        def _score(u):
+            low = u.lower()
+            if "1080" in low or "fullhd" in low: return 100
+            if "720" in low or "hd" in low: return 80
+            if "480" in low: return 50
+            if "m3u8" in low: return 40
+            return 10
+        candidates.sort(key=_score, reverse=True)
+        return candidates[0], title
+
+    return "", title
+
+def _scrape_iframes(html: str, page_url: str) -> list[str]:
+    iframes = []
+    if not html: return iframes
+    for m in re.finditer(r'<iframe[^>]+src=[\'"]([^\'"]+)[\'"]', html, re.I):
+        src = m.group(1).replace("&amp;", "&").strip()
+        if src.startswith("//"):
+            src = "https:" + src
+        elif not src.startswith("http"):
+            src = urljoin(page_url, src)
+        low = src.lower()
+        if not any(b in low for b in ("google", "facebook", "twitter", "disqus", "ads", "histats", "analytics")):
+            if src not in iframes:
+                iframes.append(src)
+    return iframes
+
+
+# ══════════════════════════════════════════════════════
+#  PLAYWRIGHT UNIVERSAL NETWORK SNIFFER
+# ══════════════════════════════════════════════════════
+def _universal_snatch_sync(page_url: str) -> dict:
+    from playwright.sync_api import sync_playwright
+    media_candidates = []
+    page_title = ""
+
+    try:
+        with sync_playwright() as p:
+            browser, context = _sync_launch_chrome(p, headless=True)
+            if COOKIES_FILE:
+                try: context.add_cookies(_parse_netscape_cookies(COOKIES_FILE))
+                except Exception: pass
+
+            page = context.new_page()
+
+            page.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                window.chrome = { runtime: {} };
+                window.open = function() { return null; };
+                window.alert = function() { return null; };
+                document.addEventListener('DOMContentLoaded', () => {
+                    try {
+                        const style = document.createElement('style');
+                        style.innerHTML = `
+                            [id*="overlay"], [class*="overlay"], [id*="pop"], [class*="pop"],
+                            div[style*="z-index: 2147483647"], div[style*="position: fixed"] {
+                                pointer-events: none !important;
+                            }
+                            video, button, .vjs-big-play-button, .play {
+                                pointer-events: auto !important;
+                                z-index: 2147483648 !important;
+                            }
+                        `;
+                        document.head.appendChild(style);
+                    } catch(e) {}
+                });
+            """)
+
+            def on_request(req):
+                u = req.url
+                u_clean = u.split("?")[0].rstrip("/").lower()
+                if any(x in u_clean for x in ("preview", "thumb", "poster", ".jpg", ".png", ".gif", "analytics", "favicon")):
+                    return
+                is_m3u8 = ".m3u8" in u_clean or "m3u8" in req.headers.get("accept", "").lower()
+                is_mpd = ".mpd" in u_clean or "/manifest" in u_clean or "dash" in req.headers.get("accept", "").lower()
+                is_direct = any(u_clean.endswith(ext) for ext in (".mp4", ".webm", ".ts", ".mkv", ".m4s")) or ("/get_file/" in u)
+
+                if is_m3u8 or is_mpd or is_direct or "voe-network.net" in u or "doodcdn" in u or "/video~" in u:
+                    hdrs = dict(req.headers)
+                    hdrs.setdefault("Referer", clean_referer(page.url))
+                    media_candidates.append({
+                        "url": u, "headers": hdrs,
+                        "type": "hls" if is_m3u8 else ("dash" if is_mpd else "direct"),
+                        "page_url": page.url,
+                    })
+
+            def on_response(resp):
+                ctype = resp.headers.get("content-type", "").lower()
+                u = resp.url
+                if any(x in ctype for x in ("mpegurl", "video/mp4", "video/mp2t", "application/x-mpegurl", "video/octet-stream", "dash+xml")) or "doodcdn" in u or ".mpd" in u:
+                    hdrs = dict(resp.request.headers)
+                    hdrs.setdefault("Referer", clean_referer(page.url))
+                    media_candidates.append({
+                        "url": u, "headers": hdrs,
+                        "type": "hls" if ("mpegurl" in ctype or ".m3u8" in u) else ("dash" if (".mpd" in u or "dash" in ctype) else "direct"),
+                        "page_url": page.url,
+                    })
+
+            page.on("request", on_request)
+            page.on("response", on_response)
+
+            try: page.goto(page_url, wait_until="domcontentloaded", timeout=12000)
+            except Exception: pass
+
+            try: page_title = page.title()
+            except Exception: page_title = ""
+
+            for frame in page.frames:
+                try:
+                    f_content = decode_js_escapes(frame.content())
+                    kvs_url, _ = _scrape_kvs_and_html5(f_content, frame.url or page_url)
+                    if kvs_url:
+                        media_candidates.append({
+                            "url": kvs_url,
+                            "headers": {"Referer": clean_referer(frame.url or page_url), "User-Agent": _STANDARD_UA},
+                            "type": "direct",
+                            "page_url": page_url
+                        })
+                except Exception: pass
+
+            time.sleep(1.0)
+            for sel in [
+                "button.vjs-big-play-button", ".jw-display-icon-display",
+                "button[aria-label='Play']", ".play-button", "#play", "video",
+                ".fp-play", ".fp-ui", "#kt_player", ".player-holder", ".play"
+            ]:
+                try:
+                    el = page.query_selector(sel)
+                    if el:
+                        el.click(timeout=800, no_wait_after=True)
+                        time.sleep(0.8)
+                        if media_candidates: break
+                except Exception: pass
+
+            for _ in range(4):
+                if media_candidates: break
+                time.sleep(0.8)
+
+            context.close()
+            browser.close()
+    except Exception as e:
+        logging.warning(f"[universal_snatch] error: {e}")
+
+    if media_candidates:
+        def _score(item):
+            u = item["url"].lower()
+            if "master.m3u8" in u or "playlist.m3u8" in u or ".mpd" in u: return 100
+            if ".m3u8" in u: return 80
+            if ".mp4" in u or "doodcdn" in u or "/video~" in u or "/get_file/" in u: return 60
+            return 10
+        media_candidates.sort(key=_score, reverse=True)
+        best = media_candidates[0]
+        best["title"] = page_title
+        return best
+    return None
+
+async def universal_snatch(page_url: str, status_msg=None) -> dict:
+    if status_msg:
+        await safe_edit(status_msg, "🌐 *Step 1/4: Sniffing stream (browser sniffer)...*", force=True)
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(_universal_snatch_sync, page_url), timeout=20)
+    except Exception as e:
+        logging.warning(f"[universal_snatch skipped/timeout] {e}")
+        return None
+
+
+# ══════════════════════════════════════════════════════
+#  ALL 13+ SPECIALIST SCRAPERS + VOE + SERIENSTREAM
+# ══════════════════════════════════════════════════════
+_VIDMOLY_DOMAINS    = {"vidmoly.me", "vidmoly.biz", "vidmoly.to", "vidmoly.net", "vidmoly.org"}
+_LULU_DOMAINS       = {"lulustream.com", "luluvid.com", "luluvdo.com", "luluvdoo.com", "lulucdn.com", "hrnyvid.com", "hrnytube.com", "luluvids.com", "luluplayer.com", "luluvideo.com", "nsfwlulu.com", "luluembed.com"}
+_DOOD_DOMAINS       = {"doodstream.com", "doodstream.co", "dood.watch", "dood.to", "dood.so", "dood.cx", "dood.la", "dood.sh", "dood.pm", "dood.wf", "dood.re", "dood.yt", "dood.ws", "dood.vip", "dood.pro", "dood.li", "dood.one", "dood.run", "dood.video", "dood.buzz", "dood.best", "dood.fun", "doodcdn.com", "doodcdn.net", "doodcdn.io", "ds2play.com", "ds2video.com", "playmogo.com", "dooood.com", "doods.pro", "myvidplay.com", "dsvplay.com", "d000d.com", "vvide0.com"}
+_FILEMOON_DOMAINS   = {"filemoon.sx", "filemoon.to", "filemoon.in", "filemoon.nl", "filemoon.cc", "filemoon.io", "moonplayer.to", "filemoon.art", "filemoon.fun", "filemoon.icu", "filemoon.site", "filemoon.xyz", "filemoon.top", "filemoon.wf", "kerapoxy.cc", "moonembed.pro", "filemoonembed.com"}
+_STREAMTAPE_DOMAINS = {"streamtape.com", "streamtape.to", "streamtape.net", "streamtape.xyz", "streamtape.site", "streamtape.cc", "streamtape.ca", "streamtape.space", "tapecontent.net", "strcloud.in", "strcloud.link", "streamtape.co", "streamtape.biz", "streamtape.app", "streamtape.pw", "streamtape.online", "streamtape.live", "streamta.pe", "scloud.online", "strcloud.online"}
+_STREAMWISH_DOMAINS = {"streamwish.com", "streamwish.to", "streamwish.site", "wishfast.top", "streamwish.net", "swdyu.com", "jwvid.tv", "asnimated.com", "stmruby.com", "streamruby.com", "streamwish.fun", "streamwish.space", "streamwish.xyz", "streamwish.pro", "dwish.tv", "awish.pro", "awish.top", "awish.live", "mwish.pro", "swiftload.io", "asianload.net", "playflows.net", "playertv.net", "playm4u.net"}
+_MIXDROP_DOMAINS    = {"mixdrop.co", "mixdrop.to", "mixdrop.bz", "mixdrop.ch", "mixdrop.club", "mixdrop.gl", "mixdrop.sx", "mixdrop.ag", "mixdrop.ps", "mixdrop.is", "mixdrop.vc", "mixdrop.nu", "mixdrop.ms", "mixdrop.ws", "mixdrp.to"}
+_VIDGUARD_DOMAINS   = {"vidguard.to", "vidguard.online", "vgfplay.com", "listeamed.net", "bembed.net", "vid142.site", "v6embed.xyz", "vgembed.com", "vidguard.pro", "vidguard.live", "vidguard.stream", "s1.vidguard.to", "s2.vidguard.to", "s3.vidguard.to", "vgplayer.com", "tomatomatela.club"}
+_VIDHIDE_DOMAINS    = {"vidhide.com", "vidhide.net", "vidhide.to", "avhide.com", "avhide.to", "vidhidevip.com", "vidhide.pro", "vidhide.live", "vidhide.online", "vidhide.stream", "vidhidepro.com", "embedv.net", "sfastwish.com", "smoothpre.com", "ftswish.top", "guccihide.com", "anihdplay.com", "anihide.com"}
+_VIDNEST_DOMAINS    = {"vidnest.net", "vidnest.org", "vidnest.site", "vidnest.to", "vidnest.xyz", "vidnest.live"}
+_NETU_DOMAINS       = {"netu.ac", "netu.io", "hqq.tv", "hqq.ac", "hqq.to", "waaw.tv", "gomo.to", "netu.to", "netu.one", "netu.cc", "netuplayer.top", "hqq.li", "hqq.me", "hqq.la", "embed.hqq.tv"}
+_VOE_DOMAINS        = {"voe.sx", "voe.to", "voe.net", "voe.ac", "voe.cc", "voeunblocked.net", "voe-unblock.com", "voe.vc", "voe.pm", "voe.ws", "voe.gg", "voe.gl", "voe.ms", "voe.sh", "voe.cx", "voe.buzz", "voe.run", "voe.tw", "voe.pro", "voe.media", "voe.stream", "voe.one"}
+_VEEV_DOMAINS       = {"veev.to", "veev.cc", "veev.ac", "veev.net", "veev.io", "veev.tv"}
+_BIGWARP_DOMAINS    = {"bigwarp.io", "bigwarp.net", "bigwarp.to", "bigwarp.cc", "bigwarp.site"}
+
+_SERIENSTREAM_DOMAINS = {
+    "serienstream.to", "serienstream.cx", "s.to", "serien.sx", "serienstream.sx",
+    "aniworld.to", "aniworld.info", "186.2.175.5"
+}
+
+def _is_serienstream_url(url: str) -> bool:
+    d = urlparse(url).netloc.lower().removeprefix("www.")
+    return any(d == x or d.endswith("." + x) for x in _SERIENSTREAM_DOMAINS) or ("serienstream" in d) or ("aniworld" in d)
+
+def _is_voe_url(url: str) -> bool:
+    d = urlparse(url).netloc.lower().removeprefix("www.")
+    if any(d == x or d.endswith("." + x) for x in _VOE_DOMAINS) or "voe" in d: return True
+    parts = urlparse(url).path.strip("/").split("/")
+    slug = parts[-1] if parts else ""
+    return bool(re.fullmatch(r"[a-zA-Z0-9]{10,14}", slug) and (len(parts) == 1 or (len(parts) == 2 and parts[0] in ("e", "v"))))
+
+def _is_vidmoly_url(url: str) -> bool:
+    d = urlparse(url).netloc.lower().removeprefix("www.")
+    return any(d == x or d.endswith("." + x) for x in _VIDMOLY_DOMAINS)
+
+def _is_lulu_url(url: str) -> bool:
+    d = urlparse(url).netloc.lower().removeprefix("www.")
+    return any(d == x or d.endswith("." + x) for x in _LULU_DOMAINS)
+
+def _is_doodstream_url(url: str) -> bool:
+    d = urlparse(url).netloc.lower().removeprefix("www.")
+    return any(d == x or d.endswith("." + x) for x in _DOOD_DOMAINS)
+
+def _is_filemoon_url(url: str) -> bool:
+    d = urlparse(url).netloc.lower().removeprefix("www.")
+    return any(d == x or d.endswith("." + x) for x in _FILEMOON_DOMAINS)
+
+def _is_streamtape_url(url: str) -> bool:
+    d = urlparse(url).netloc.lower().removeprefix("www.")
+    return any(d == x or d.endswith("." + x) for x in _STREAMTAPE_DOMAINS)
+
+def _is_streamwish_url(url: str) -> bool:
+    d = urlparse(url).netloc.lower().removeprefix("www.")
+    return any(d == x or d.endswith("." + x) for x in _STREAMWISH_DOMAINS)
+
+def _is_mixdrop_url(url: str) -> bool:
+    d = urlparse(url).netloc.lower().removeprefix("www.")
+    return any(d == x or d.endswith("." + x) for x in _MIXDROP_DOMAINS)
+
+def _is_vidguard_url(url: str) -> bool:
+    d = urlparse(url).netloc.lower().removeprefix("www.")
+    return any(d == x or d.endswith("." + x) for x in _VIDGUARD_DOMAINS)
+
+def _is_generic_jwplayer_url(url: str) -> bool:
+    d = urlparse(url).netloc.lower().removeprefix("www.")
+    for s in (_VIDNEST_DOMAINS, _NETU_DOMAINS, _VOE_DOMAINS, _VEEV_DOMAINS, _BIGWARP_DOMAINS):
+        if any(d == x or d.endswith("." + x) for x in s): return True
+    return False
+
+def _scrape_vidmoly(page_url: str) -> tuple:
+    try:
+        parsed = urlparse(page_url)
+        raw = parsed.path.rstrip("/").split("/")[-1]
+        slug = re.sub(r'^(?:embed-|w-|v-)', '', raw, flags=re.I)
+        slug = re.sub(r'(?:\.html|\.mp4|\.mkv)$', '', slug, flags=re.I)
+        domain = parsed.netloc
+        embed_url = f"{parsed.scheme}://{domain}/embed-{slug}.html"
+        resp = _cf_get(embed_url, referer=page_url or f"{parsed.scheme}://{domain}/", timeout=20)
+        html = decode_js_escapes(resp.text)
+
+        stream_url = ""
+        for pat in [
+            r'sources\s*:\s*\[\s*\{[^}]*?["\']?file["\']?\s*:\s*["\']([^\'"]+\.(?:m3u8|mp4)[^\'"]*)["\']',
+            r'["\']?file["\']?\s*:\s*["\']([^\'"]+\.(?:m3u8|mp4)[^\'"]*)["\']',
+            r'(https?://[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*)',
+            r'(https?://[^\s"\'<>]+\.mp4[^\s"\'<>]*)',
+        ]:
+            m = re.search(pat, html, re.I)
+            if m and m.group(1).startswith("http"):
+                stream_url = m.group(1).replace("&amp;", "&").replace("\\", "").strip()
+                break
+
+        title = _extract_title_from_html(html, fallback=f"Vidmoly_{slug}")
+        return stream_url, title, embed_url
+    except Exception as e:
+        logging.warning("[vidmoly] failed: " + str(e))
+    return "", "", page_url
+
+def _scrape_lulustream(page_url: str) -> tuple:
+    try:
+        parsed   = urlparse(page_url)
+        raw_slug = parsed.path.rstrip("/").rsplit("/", 1)[-1]
+        video_id = re.sub(r"(_[a-zA-Z0-9]+|\.[a-zA-Z0-9]+)$", "", raw_slug)
+        base      = f"{parsed.scheme}://{parsed.netloc}"
+        embed_url = f"{base}/e/{video_id}"
+
+        resp = _cf_get(embed_url, referer=page_url, timeout=20)
+        html = decode_js_escapes(resp.text)
+
+        for pat in [
+            r'(https?://[^\s"\'<>\\]+/hls2/[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*)',
+            r'(https?://[^\s"\'<>\\]+master\.m3u8[^\s"\'<>\\]*)',
+            r'(https?://[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*)',
+            r'sources\s*:\s*\[\s*\{[^}]*?["\']?file["\']?\s*:\s*["\']([^\'"]+\.(?:m3u8|mp4)[^\'"]*)["\']',
+            r'(https?://[^\s"\'<>]+\.mp4[^\s"\'<>]*)',
+        ]:
+            m = re.search(pat, html, re.I)
+            if m:
+                u = m.group(1).replace("&amp;", "&").replace("\\", "").strip()
+                if u.startswith("http") and not any(x in u for x in ("img.", "thumb", ".jpg", ".png", "lulucdn.com/")):
+                    return u, base + "/"
+    except Exception as e:
+        logging.warning("[lulu] failed: " + str(e))
+    return "", page_url
+
+def _scrape_doodstream(page_url: str) -> tuple:
+    try:
+        parsed = urlparse(page_url)
+        path = parsed.path
+        if "/d/" in path: path = path.replace("/d/", "/e/")
+        elif "/f/" in path: path = path.replace("/f/", "/e/")
+        elif not path.startswith("/e/"):
+            slug = path.rstrip("/").split("/")[-1]
+            path = f"/e/{slug}"
+
+        embed_url = f"{parsed.scheme}://{parsed.netloc}{path}"
+        resp = _cf_get(embed_url, referer="https://www.google.com/", timeout=20)
+        html = decode_js_escapes(resp.text)
+        final_url = str(getattr(resp, "url", "")) or embed_url
+        base = f"{urlparse(final_url).scheme}://{urlparse(final_url).netloc}"
+
+        _PAT_PASS = [
+            r"['\"](/pass_md5/[^'\"]+)['\"]",
+            r"\$\.get\('(/pass_md5/[^']+)'",
+            r"(/pass_md5/[a-zA-Z0-9_\-]+/[a-zA-Z0-9_\-]+)",
+            r"(/pass_md5/[^\s'\"\\&]+)"
+        ]
+        def _find_pass(text):
+            for pat in _PAT_PASS:
+                m = re.search(pat, text)
+                if m: return m.group(1).strip().rstrip("\\")
+            return None
+
+        pass_path = _find_pass(html)
+        title = _extract_title_from_html(html, fallback=f"Dood_{path.rstrip('/').split('/')[-1]}")
+
+        if pass_path:
+            pass_url = urljoin(base, pass_path)
+            token = pass_path.rstrip("/").rsplit("/", 1)[-1]
+            pass_resp = _cf_get(pass_url, referer=final_url, timeout=15)
+            raw_cdn = pass_resp.text.strip()
+            if raw_cdn.startswith("http"):
+                random_suffix = "".join(random.choices(string.ascii_letters + string.digits, k=10))
+                expiry = int(time.time() * 1000)
+                final_stream = f"{raw_cdn}{random_suffix}?token={token}&expiry={expiry}"
+                return final_stream, title, final_url
+    except Exception as e:
+        logging.warning("[dood] failed: " + str(e))
+    return "", "", page_url
+
+def _scrape_filemoon(page_url: str) -> str:
+    try:
+        pu = urlparse(page_url)
+        path_parts = [p for p in pu.path.split("/") if p]
+        embed_url = f"{pu.scheme}://{pu.netloc}/e/{path_parts[1]}" if path_parts and path_parts[0] in ("d", "f", "v") else page_url
+        html = decode_js_escapes(_cf_get(embed_url, referer=page_url, timeout=20).text)
+        for pat in [
+            r'sources\s*:\s*\[\s*\{[^}]*?["\']?file["\']?\s*:\s*["\']([^\'"]+\.(?:m3u8|mp4)[^\'"]*)["\']',
+            r'["\']?file["\']?\s*:\s*["\']([^\'"]+\.(?:m3u8|mp4)[^\'"]*)["\']',
+            r'(https?://[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*)',
+            r'(https?://[^\s"\'<>]+\.mp4[^\s"\'<>]*)',
+        ]:
+            m = re.search(pat, html, re.I)
+            if m and m.group(1).startswith("http"): return m.group(1).replace("&amp;", "&").replace("\\", "")
+    except Exception as e:
+        logging.warning("[filemoon] failed: " + str(e))
+    return ""
+
+def _scrape_streamtape(page_url: str) -> str:
+    try:
+        html = decode_js_escapes(_cf_get(page_url, referer=page_url, timeout=20).text)
+        for pat in [
+            r"innerHTML\s*=\s*['\"]([^'\"]+)['\"]\s*\+\s*\(['\"]([^'\"]+)['\"]",
+            r"innerHTML\s*=\s*['\"]([^'\"]{20,})['\"]",
+        ]:
+            m = re.search(pat, html)
+            if m:
+                raw = m.group(1) + (m.group(2) if m.lastindex >= 2 else "")
+                result = "https://" + raw.strip().lstrip("/") if not raw.startswith("http") else raw.strip()
+                result = re.sub(r"(?<=https://)s[a-z]{3,20}tape\.[a-z]+", "streamtape.to", result)
+                result = re.sub(r"/ge[a-z_]{0,15}vid[a-z_]{0,8}\?", "/get_video?", result)
+                if "token" in result: return result
+    except Exception as e:
+        logging.warning("[streamtape] failed: " + str(e))
+    return ""
+
+def _scrape_streamwish(page_url: str) -> str:
+    try:
+        html = decode_js_escapes(_cf_get(page_url, referer=page_url, timeout=20).text)
+        for pat in [
+            r'sources\s*:\s*\[\s*\{[^}]*?["\']?file["\']?\s*:\s*["\']([^\'"]+\.(?:m3u8|mp4)[^\'"]*)["\']',
+            r'(https?://[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*)',
+            r'(https?://[^\s"\'<>]+\.mp4[^\s"\'<>]*)',
+        ]:
+            m = re.search(pat, html)
+            if m and m.group(1).startswith("http"): return m.group(1).replace("&amp;", "&").replace("\\", "")
+    except Exception as e:
+        logging.warning("[streamwish] failed: " + str(e))
+    return ""
+
+def _scrape_mixdrop(page_url: str) -> str:
+    try:
+        html = decode_js_escapes(_cf_get(page_url, referer=page_url, timeout=20).text)
+        for pat in [r'MDCore\.wurl\s*=\s*["\']([^\'"]+)["\']', r'(?:wurl|vurl)\s*=\s*["\']([^\'"]+\.mp4[^\'"]*)["\']']:
+            m = re.search(pat, html)
+            if m:
+                raw = m.group(1).replace("\\", "")
+                return ("https:" + raw) if raw.startswith("//") else raw
+    except Exception as e:
+        logging.warning("[mixdrop] failed: " + str(e))
+    return ""
+
+def _scrape_vidguard(page_url: str) -> str:
+    import base64 as _b64
+    try:
+        html = decode_js_escapes(_cf_get(page_url, referer=page_url, timeout=20).text)
+        m = re.search(r'asu\s*=\s*["\']([A-Za-z0-9+/=_\-]+)["\']', html)
+        if m:
+            rev = m.group(1)[::-1]
+            shifted = "".join(chr(ord(c) - 2) for c in rev)
+            decoded = _b64.b64decode(shifted + "==").decode("utf-8", errors="ignore")
+            u = re.search(r'(https?://[^\s"\'<>]+\.(?:m3u8|mp4)[^\s"\'<>]*)', decoded)
+            if u: return u.group(1).replace("&amp;", "&")
+    except Exception as e:
+        logging.warning("[vidguard] failed: " + str(e))
+    return ""
+
+def _scrape_jwplayer_sources(html: str) -> str:
+    html = decode_js_escapes(html)
+    for pat in [
+        r'sources\s*:\s*\[\s*\{[^}]*?["\']?file["\']?\s*:\s*["\']([^\'"]+\.(?:m3u8|mp4)[^\'"]*)["\']',
+        r'["\']?file["\']?\s*:\s*["\']([^\'"]+\.(?:m3u8|mp4)[^\'"]*)["\']',
+        r'(https?://[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*)',
+        r'(https?://[^\s"\'<>]+\.mp4[^\s"\'<>]*)',
+    ]:
+        m = re.search(pat, html, re.I)
+        if m and m.group(1).startswith("http"): return m.group(1).replace("&amp;", "&").replace("\\", "")
+    for pm in re.finditer(r"eval\s*\(\s*function\s*\(p,a,c,k,e", html):
+        unpacked = _unpack_js(html[pm.start():pm.start() + 20000])
+        if unpacked:
+            m2 = re.search(r'["\']?file["\']?\s*:\s*["\']([^\'"]+\.(?:m3u8|mp4)[^\'"]*)["\']', unpacked, re.I)
+            if m2 and m2.group(1).startswith("http"): return m2.group(1).replace("&amp;", "&")
+    return ""
+
+def _scrape_vidnest(page_url: str) -> str:
+    try:
+        p    = urlparse(page_url)
+        vid  = p.path.rstrip("/").rsplit("/", 1)[-1]
+        html = decode_js_escapes(_cf_get(f"{p.scheme}://{p.netloc}/e/{vid}", referer=page_url, timeout=20).text)
+        return _scrape_jwplayer_sources(html)
+    except Exception: return ""
+
+def _scrape_netu(page_url: str) -> str:
+    try:
+        p = urlparse(page_url)
+        vid = (parse_qs(p.query).get("vid", [""])[0] or p.path.rstrip("/").rsplit("/", 1)[-1])
+        if vid:
+            from curl_cffi import requests as _cr
+            r = _cr.post(f"{p.scheme}://{p.netloc}/player/index.php", params={"data": vid, "do": "getVideo"}, data={"hash": "", "r": page_url}, impersonate="chrome124", timeout=20)
+            u = re.search(r'(https?://[^\s"\'<>]+\.(?:m3u8|mp4)[^\s"\'<>]*)', r.text)
+            if u: return u.group(1).replace("&amp;", "&")
+        html = decode_js_escapes(_cf_get(page_url, referer=page_url, timeout=20).text)
+        return _scrape_jwplayer_sources(html)
+    except Exception: return ""
+
+def _scrape_veev_bigwarp(page_url: str, tag: str = "veev") -> str:
+    try:
+        p    = urlparse(page_url)
+        vid  = p.path.rstrip("/").rsplit("/", 1)[-1]
+        html = decode_js_escapes(_cf_get(f"{p.scheme}://{p.netloc}/e/{vid}", referer=page_url, timeout=20).text)
+        return _scrape_jwplayer_sources(html)
+    except Exception: return ""
+
+def _scrape_voe(page_url: str) -> tuple:
+    import base64 as _b64, json as _json
+    curr_url, referer, html, title = page_url, page_url, "", ""
+
+    for _ in range(4):
+        try:
+            resp = _cf_get(curr_url, referer=referer, timeout=15)
+            html = decode_js_escapes(resp.text)
+            final_url = str(getattr(resp, "url", "")) or curr_url
+            if final_url != curr_url: referer, curr_url = curr_url, final_url
+        except Exception: break
+
+        m = re.search(r"""(?:window\.)?location(?:\.href|\.replace\()?['"]?(https?://[^'">\s]+)""", html, re.I)
+        if m and m.group(1) != curr_url:
+            referer, curr_url = curr_url, m.group(1)
+            continue
+        break
+
+    title = _extract_title_from_html(html)
+    for pat in [r'''['"]hls['"]\s*:\s*['"]([^'"]+\.m3u8[^'"]*)['"]''', r'''['"]file['"]\s*:\s*['"]([^'"]+\.(?:m3u8|mp4)[^\'"]*)['"]''']:
+        m = re.search(pat, html, re.I)
+        if m: return m.group(1).replace("&amp;", "&").replace("\\", "").strip(), title, curr_url
+
+    def _rot13(s: str) -> str:
+        return s.translate(str.maketrans("ABCDEFGHIJKLMabcdefghijklmNOPQRSTUVWXYZnopqrstuvwxyz", "NOPQRSTUVWXYZnopqrstuvwxyzABCDEFGHIJKLMabcdefghijklm"))
+
+    candidates = [m.group(1) for m in re.finditer(r'''(?:sources|payload|config)\s*=\s*['"]([A-Za-z0-9+/=@$^~%*!#&_\-]{40,})['"]''', html, re.I)]
+    for cand in candidates:
+        try:
+            s = _rot13(cand.strip())
+            for dummy in ("@$", "^^", "~@", "%?", "*~", "!!", "#&", "_", "-"): s = s.replace(dummy, "")
+            dec1 = _b64.b64decode(s + "=" * ((4 - len(s) % 4) % 4)).decode("utf-8", errors="ignore")
+            shifted = "".join(chr(ord(c) - 3) for c in dec1)[::-1]
+            dec2 = _b64.b64decode(shifted + "=" * ((4 - len(shifted) % 4) % 4)).decode("utf-8", errors="ignore")
+            data = _json.loads(dec2) if dec2.startswith("{") else {}
+            for k in ("direct_access_url", "file", "hls", "mp4"):
+                if isinstance(data.get(k), str) and data[k].startswith("http"):
+                    return data[k].replace("&amp;", "&"), title, curr_url
+        except Exception: pass
+
+    return "", title, curr_url
+
+def _playwright_resolve_serienstream(target_url: str) -> tuple:
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser, context = _sync_launch_chrome(p, headless=True)
+            page = context.new_page()
+            page.goto(target_url, wait_until="domcontentloaded", timeout=10000)
+
+            for _ in range(6):
+                if page.query_selector(".hosterSiteVideo, [data-link-target], a.watchEpisode"): break
+                page.wait_for_timeout(600)
+
+            title = ""
+            el_title = page.query_selector(".episodeGermanTitle, h1")
+            if el_title: title = el_title.inner_text().strip()
+
+            items = page.evaluate("""() => {
+                const out = [];
+                document.querySelectorAll('li[data-link-target], a[data-link-target], a.watchEpisode').forEach(el => {
+                    const target = el.getAttribute('data-link-target') || el.getAttribute('href') || '';
+                    const txt = (el.innerText || '') + ' ' + (el.innerHTML || '');
+                    if (target) out.push({ target: target, text: txt });
+                });
+                return out;
+            }""")
+
+            chosen = next((it["target"] for it in items if "voe" in it["text"].lower()), items[0]["target"] if items else None)
+            if not chosen:
+                context.close(); browser.close()
+                return "", title, target_url
+
+            dest = urljoin(page.url, chosen)
+            resolved = [None]
+            page.on("request", lambda req: resolved.append(req.url) if _is_voe_url(req.url) or any(x in req.url for x in ("voe", "delivery-node", "streamtape", "dood")) else None)
+            try: page.goto(dest, wait_until="domcontentloaded", timeout=10000)
+            except Exception: pass
+
+            res_url = next((u for u in resolved if u), page.url)
+            context.close(); browser.close()
+            return res_url, title, dest
+    except Exception as e:
+        logging.warning(f"[serienstream playwright] failed: {e}")
+        return "", "", target_url
+
+def _scrape_serienstream(page_url: str) -> tuple:
+    pu = urlparse(page_url)
+    m_slug = re.search(r'/(?:serie|anime)/(?:stream/)?([^/]+)/staffel-(\d+)/episode-(\d+)', pu.path, re.I)
+    slug = m_slug.group(1) if m_slug else ""
+    s_num = int(m_slug.group(2)) if m_slug else 1
+    e_num = int(m_slug.group(3)) if m_slug else 1
+    title = f"{slug.replace('-', ' ').title()} S{s_num:02d}E{e_num:02d}" if slug else ""
+
+    clean_path = f"/serie/stream/{slug}/staffel-{s_num}/episode-{e_num}" if slug else pu.path
+    candidates = [f"https://serienstream.to{clean_path}", f"https://serienstream.cx{clean_path}"]
+
+    for cand in candidates:
+        hoster_url, p_title, final_ref = _playwright_resolve_serienstream(cand)
+        if hoster_url and hoster_url != cand:
+            title = title or p_title
+            if _is_voe_url(hoster_url):
+                stream, voe_t, ref = _scrape_voe(hoster_url)
+                return stream, title or voe_t, clean_referer(ref)
+            else:
+                stream, h_t, ref = _scrape_real_url(hoster_url)
+                return stream, title or h_t, clean_referer(ref)
+    return "", title, page_url
+
+def _scrape_real_url(url: str) -> tuple:
+    # ── 1. SHORTLINK UNROLLING & PARAMETER UNPACKING ─────
+    url = unroll_shortener(url)
+    url = unwrap_redirect_parameters(url)
+
+    def _with_title(stream_url, page_html="", page_url_for_fallback="", referer=""):
+        title = _extract_title_from_html(page_html) if page_html else ""
+        if not title and page_url_for_fallback:
+            parts = [p for p in urlparse(page_url_for_fallback).path.split("/") if p]
+            if parts: title = parts[-1].replace("-", " ").replace("_", " ").strip()
+        return stream_url, title, clean_referer(referer)
+
+    try:
+        if _is_serienstream_url(url):
+            stream, s_title, ref = _scrape_serienstream(url)
+            if stream: return stream, s_title, clean_referer(ref)
+
+        if _is_voe_url(url):
+            stream, v_title, ref = _scrape_voe(url)
+            if stream: return stream, v_title, clean_referer(ref)
+
+        if _is_vidmoly_url(url):
+            stream, vm_title, ref = _scrape_vidmoly(url)
+            if stream: return stream, vm_title, clean_referer(ref)
+
+        if _is_lulu_url(url):
+            stream, ref_root = _scrape_lulustream(url)
+            return _with_title(stream or url, "", url, referer=ref_root)
+
+        if _is_doodstream_url(url):
+            stream, d_title, ref = _scrape_doodstream(url)
+            if stream: return stream, d_title, clean_referer(ref)
+
+        if _is_filemoon_url(url): return _with_title(_scrape_filemoon(url) or url, "", url)
+        if _is_streamtape_url(url): return _with_title(_scrape_streamtape(url) or url, "", url, referer=url)
+        if _is_streamwish_url(url): return _with_title(_scrape_streamwish(url) or url, "", url)
+        if _is_mixdrop_url(url): return _with_title(_scrape_mixdrop(url) or url, page_url_for_fallback=url)
+        if _is_vidguard_url(url): return _with_title(_scrape_vidguard(url) or url, page_url_for_fallback=url)
+
+        if _is_generic_jwplayer_url(url):
+            d = urlparse(url).netloc.lower().removeprefix("www.")
+            if any(d == x or d.endswith("."+x) for x in _VIDNEST_DOMAINS): stream = _scrape_vidnest(url) or url
+            elif any(d == x or d.endswith("."+x) for x in _NETU_DOMAINS): stream = _scrape_netu(url) or url
+            elif any(d == x or d.endswith("."+x) for x in _VOE_DOMAINS):
+                _voe_s, _voe_t, _voe_r = _scrape_voe(url)
+                return _voe_s or url, _voe_t, clean_referer(_voe_r or url)
+            else: stream = _scrape_veev_bigwarp(url, d.split(".")[0]) or url
+            return _with_title(stream, "", url)
+
+        # Bunkr
+        if any(h in url for h in ("bunkr.si", "bunkr.su", "bunkr.la", "bunkr.cr", "bunkr.is")):
+            try:
+                from curl_cffi import requests as _cr2
+                _br = _cr2.get(url, impersonate="chrome124", timeout=15)
+                _id_m = re.search(r'data-file-id="([^"]+)"', _br.text)
+                if _id_m:
+                    _data_id = _id_m.group(1)
+                    _ref = "https://get.bunkrr.su/file/" + _data_id
+                    _ar = _cr2.post("https://apidl.bunkr.ru/api/_001_v2", json={"id": _data_id}, headers={"Referer": _ref, "Origin": "https://get.bunkrr.su"}, impersonate="chrome124", timeout=15).json()
+                    if _ar.get("url"): return _ar["url"], url.rstrip("/").split("/")[-1], _ref
+            except Exception: pass
+
+        # Fetch page HTML via curl_cffi
+        resp = _cf_get(url, timeout=15)
+        raw_html = resp.text if hasattr(resp, "text") else ""
+        html = decode_js_escapes(raw_html)
+        if not html:
+            return url, "", ""
+
+        title = _extract_title_from_html(html)
+
+        # 1. Check KVS / HTML5 tags / Flashvars directly on page
+        kvs_stream, kvs_title = _scrape_kvs_and_html5(html, url)
+        if kvs_stream:
+            return kvs_stream, title or kvs_title, clean_referer(url)
+
+        # 2. Check OpenGraph / JSON-LD schema (strictly media files, not embed pages)
+        og_stream, og_title = _scrape_schema_and_og(html, url)
+        if og_stream:
+            return og_stream, title or og_title, clean_referer(url)
+
+        # 3. Check JWPlayer sources
+        stream = _scrape_jwplayer_sources(html)
+        if stream:
+            return stream, title, clean_referer(url)
+
+        # 4. Universal Iframe & Embed Page Inspector
+        candidates_to_inspect = _scrape_iframes(html, url)
+
+        # Also inspect embed links found in JSON-LD or meta tags
+        for m in re.finditer(r'["\'](?:embedUrl|player_url)["\']\s*:\s*["\']([^"\']+)["\']', html, re.I):
+            emb = urljoin(url, m.group(1).replace("&amp;", "&").strip())
+            if emb not in candidates_to_inspect:
+                candidates_to_inspect.append(emb)
+
+        for ifr in candidates_to_inspect:
+            sub_stream, sub_title, sub_ref = _scrape_real_url(ifr)
+            if sub_stream and sub_stream != ifr:
+                return sub_stream, title or sub_title, clean_referer(sub_ref or url)
+            try:
+                ifr_resp = _cf_get(ifr, referer=url, timeout=12)
+                ifr_html = decode_js_escapes(ifr_resp.text if hasattr(ifr_resp, "text") else "")
+                if ifr_html:
+                    ifr_kvs, _ = _scrape_kvs_and_html5(ifr_html, ifr)
+                    if ifr_kvs: return ifr_kvs, title, clean_referer(ifr)
+                    ifr_jw = _scrape_jwplayer_sources(ifr_html)
+                    if ifr_jw: return ifr_jw, title, clean_referer(ifr)
+            except Exception: pass
+
+    except Exception as e:
+        logging.warning("[scraper] error: " + str(e))
+
+    return url, "", ""
+
+
+# ══════════════════════════════════════════════════════
+#  ARIA2C & DIRECT FILE DOWNLOAD ENGINE
+# ══════════════════════════════════════════════════════
+async def _do_dl_via_aria2c(url: str, out_file: str, status_msg, cancel_flag: list, headers: dict = None) -> bool:
+    cmd = [
+        ARIA2C_PATH,
+        url,
+        "-d", os.path.dirname(out_file),
+        "-o", os.path.basename(out_file),
+        "-x", "8",
+        "-s", "8",
+        "-j", "4",
+        "--min-split-size=1M",
+        "--summary-interval=2",
+        "--auto-file-renaming=false",
+        "--allow-overwrite=true",
+    ]
+    if headers:
+        for k, v in headers.items(): cmd.extend(["--header", f"{k}: {v}"])
+
+    last_edit = [0.0]
+    try:
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        while proc.returncode is None:
+            if cancel_flag[0]:
+                proc.kill()
+                return False
+            line = await proc.stdout.readline()
+            if not line: break
+            line_str = line.decode(errors="replace")
+            m = re.search(r"\((\d+)%\).*?DL:([0-9.]+[A-Za-z]+).*?ETA:([0-9A-Za-z]+)", line_str)
+            if m:
+                now = time.time()
+                if now - last_edit[0] >= 2.0:
+                    last_edit[0] = now
+                    pct, spd, eta = int(m.group(1)), m.group(2), m.group(3)
+                    bar = "▓" * int(16 * pct / 100) + "░" * (16 - int(16 * pct / 100))
+                    await safe_edit(status_msg, f"📥 *Downloading via aria2c...*\n\n[{bar}] {pct}%  •  {spd}/s  ETA {eta}")
+            await asyncio.sleep(0.05)
+        await proc.wait()
+        return os.path.exists(out_file) and os.path.getsize(out_file) > 1024 * 1024
+    except Exception as e:
+        logging.warning(f"aria2c error: {e}")
+        return False
+
+
+# ══════════════════════════════════════════════════════
+#  DOWNLOAD / UPLOAD PIPELINE
+# ══════════════════════════════════════════════════════
+def extract_thumb(video_path: str) -> str:
+    thumb = video_path + "_thumb.jpg"
+    try:
+        subprocess.run(
+            [FFMPEG_PATH, "-y", "-ss", "00:00:10", "-i", video_path,
+             "-vframes", "1", "-vf", "scale=320:-1", "-q:v", "2", thumb],
+            capture_output=True, timeout=60)
+        if os.path.exists(thumb) and os.path.getsize(thumb) > 0:
+            return thumb
+    except Exception as e:
+        logging.warning("Thumb: " + str(e))
+    return ""
+
+def remux_for_streaming(src: str) -> str:
+    base, _ = os.path.splitext(src)
+    out = base + "_stream.mp4"
+    if out == src: out = base + "_fs.mp4"
+    cmd = [FFMPEG_PATH, "-y", "-i", src, "-c", "copy", "-movflags", "+faststart", out]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=3600)
+        if r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
+            try: os.remove(src)
+            except: pass
+            return out
+    except Exception as e:
+        logging.warning("remux_for_streaming: " + str(e))
+    return src
+
+def get_video_info(path: str):
+    try:
+        r = subprocess.run([
+            FFPROBE_PATH,
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height,duration",
+            "-of", "default=noprint_wrappers=1:nokey=0",
+            path
+        ], capture_output=True, text=True, timeout=15)
+        dur, w, h = 0, 0, 0
+        for line in r.stdout.splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                v = v.strip()
+                if k == "duration" and v not in ("N/A", ""):
+                    try: dur = int(float(v))
+                    except: pass
+                elif k == "width" and v not in ("N/A", ""):
+                    try: w = int(v)
+                    except: pass
+                elif k == "height" and v not in ("N/A", ""):
+                    try: h = int(v)
+                    except: pass
+        return dur, w, h
+    except Exception as e:
+        logging.warning("get_video_info: " + str(e))
+        return 0, 0, 0
+
+async def compress_to_limit(src: str, status_msg) -> str:
+    filesize = os.path.getsize(src)
+    if filesize <= MAX_UPLOAD_BYTES: return src
+
+    loop   = asyncio.get_running_loop()
+    target = int(MAX_UPLOAD_BYTES * 0.98)
+
+    def _probe_duration(path):
+        r = subprocess.run([
+            FFPROBE_PATH,
+            "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", path,
+        ], capture_output=True, text=True, timeout=60)
+        try: return float(r.stdout.strip())
+        except ValueError: return 0.0
+
+    duration = await loop.run_in_executor(None, _probe_duration, src)
+    if duration < 1: duration = 0
+
+    base, ext = os.path.splitext(src)
+    out = base + "_tg" + (ext or ".mp4")
+
+    if duration > 0:
+        audio_bps   = 128_000
+        total_bps   = int((target * 8) / duration)
+        video_bps   = max(total_bps - audio_bps, 200_000)
+        video_kbps  = video_bps // 1000
+        pass_log    = base + "_ffpass"
+
+        await safe_edit(status_msg,
+            f"⚙️ *Compressing {fmt_size(filesize)} -> ~{fmt_size(target)}*\nVideo bitrate: {video_kbps} kbps\nRunning 2-pass encode...", force=True)
+
+        cmd_p1 = [
+            FFMPEG_PATH, "-y", "-i", src,
+            "-c:v", "libx264", "-b:v", str(video_kbps) + "k",
+            "-preset", "fast", "-pass", "1", "-an",
+            "-passlogfile", pass_log, "-f", "null", os.devnull,
+        ]
+        cmd_p2 = [
+            FFMPEG_PATH, "-y", "-i", src,
+            "-c:v", "libx264", "-b:v", str(video_kbps) + "k",
+            "-preset", "fast", "-pass", "2",
+            "-passlogfile", pass_log,
+            "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart", out,
+        ]
+
+        async def _run_pass(cmd):
+            proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+            await proc.wait()
+
+        try:
+            await _run_pass(cmd_p1)
+            await _run_pass(cmd_p2)
+        except Exception: pass
+        finally:
+            for suffix in ["", "-0.log", "-0.log.mbtree"]:
+                try: os.remove(pass_log + suffix)
+                except: pass
+
+        if os.path.exists(out) and os.path.getsize(out) <= MAX_UPLOAD_BYTES:
+            try: os.remove(src)
+            except: pass
+            return out
+
+    return src
+
+async def _do_dl_via_cffi(url: str, status_msg, cancel_flag: list, uid: int, chat_id: int, headers: dict = None, title: str = "", page_url: str = ""):
+    from curl_cffi import requests as _cr
+    loop = asyncio.get_running_loop()
+    t0 = time.time()
+    tmp_path = os.path.join(ARIA2C_DOWNLOAD_DIR, f"dl_{uid}_{int(time.time())}.mp4")
+    _progress = {"done": 0, "total": 0, "finished": False}
+
+    _ref_url = clean_referer((headers or {}).get("Referer", "") or page_url or url)
+    _hdrs = {
+        "User-Agent": _STANDARD_UA,
+        "Accept-Language": _STANDARD_LANG,
+        "Accept": "*/*",
+        "Connection": "keep-alive",
+    }
+    if _ref_url: _hdrs["Referer"] = _ref_url
+    for _k, _v in (headers or {}).items(): _hdrs[_k] = _v
+
+    def _stream_download():
+        _sess = _cr.Session(impersonate="chrome124")
+        resp = _sess.get(url, headers=_hdrs, stream=True, timeout=300)
+        resp.raise_for_status()
+        _progress["total"] = int(resp.headers.get("Content-Length", 0))
+        done = 0
+        with open(tmp_path, "wb") as fh:
+            for chunk in resp.iter_content(chunk_size=1024 * 256):
+                if cancel_flag[0]:
+                    _progress["finished"] = True
+                    return None
+                if chunk:
+                    fh.write(chunk)
+                    done += len(chunk)
+                    _progress["done"] = done
+        _progress["finished"] = True
+        return tmp_path
+
+    async def _progress_updater():
+        while not _progress["finished"]:
+            await asyncio.sleep(2.5)
+            done = _progress["done"]
+            total = _progress["total"]
+            if done > 0:
+                now = time.time()
+                label = title[:40] if title else url[:40]
+                bar = progress_bar(done, total) if total else ""
+                speed_str = speed_eta(done, total, now - t0) if total else fmt_size(done) + " downloaded"
+                await safe_edit(status_msg, f"📥 *{label}*\n\n{bar}{speed_str}")
+
+    try:
+        dl_task = loop.run_in_executor(None, _stream_download)
+        progress_task = asyncio.ensure_future(_progress_updater())
+        result_file = await dl_task
+        progress_task.cancel()
+    except Exception as e:
+        await safe_edit(status_msg, f"❌ Download failed: {e}", force=True)
+        return
+
+    if cancel_flag[0] or not result_file or not os.path.exists(result_file):
+        if os.path.exists(tmp_path): os.remove(tmp_path)
+        await safe_edit(status_msg, "❌ Cancelled or no file saved.", force=True)
+        return
+
+    await _finish_upload(result_file, title, status_msg, uid, chat_id)
+
+async def _do_dl_via_ffmpeg_hls(url: str, status_msg, cancel_flag: list, uid: int, chat_id: int, page_url: str = "", title: str = "", referer: str = ""):
+    clean_url = url.replace("&amp;", "&").replace("\\", "").strip()
+    _referer = clean_referer(referer or page_url or clean_url)
+    base_referer = f"{urlparse(_referer).scheme}://{urlparse(_referer).netloc}/"
+    _safe_title = re.sub(r'[\\/*?:"<>|]', "", title).strip() or f"video_{uid}"
+    ydl_out = os.path.join(ARIA2C_DOWNLOAD_DIR, f"hls_{uid}_{int(time.time())}.mp4")
+    loop = asyncio.get_running_loop()
+    last = [0.0]
+
+    def hook(d):
+        if cancel_flag[0]: raise Exception("__CANCELLED__")
+        st = d.get("status")
+        if st not in ("downloading", "processing"): return
+        done = d.get("fragment_index", 0) or d.get("downloaded_bytes", 0)
+        total = d.get("fragment_count", 0) or d.get("total_bytes", 0) or d.get("total_bytes_estimate", 0)
+        now_time = time.time()
+        if now_time - last[0] < 2.0: return
+        last[0] = now_time
+
+        if d.get("fragment_count"):
+            pct = int((done / total) * 100) if total else 0
+            bar = "▓" * int(16 * pct / 100) + "░" * (16 - int(16 * pct / 100))
+            text = f"📥 *Step 2/4: Streaming HLS/DASH Chunks...*\n*{_safe_title[:40]}*\n\n[{bar}] {pct}% ({done}/{total} parts)"
+        else:
+            text = f"📥 *Step 2/4: Streaming Stream...*\n*{_safe_title[:40]}*\n\n{progress_bar(done, total)}"
+        asyncio.run_coroutine_threadsafe(safe_edit(status_msg, text), loop)
+
+    def _run_ytdl_hls(ref_to_use):
+        headers_dict = {
+            "User-Agent": _STANDARD_UA,
+            "Accept-Language": _STANDARD_LANG,
+            "Referer": clean_referer(ref_to_use),
+        }
+        ydl_opts = {
+            "format": "bestvideo+bestaudio/best",
+            "outtmpl": ydl_out,
+            "quiet": True,
+            "no_warnings": True,
+            "nocheckcertificate": True,
+            "concurrent_fragment_downloads": 4,
+            "progress_hooks": [hook],
+            "http_headers": headers_dict,
+        }
+        if COOKIES_FILE: ydl_opts["cookiefile"] = COOKIES_FILE
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([clean_url])
+
+    for active_ref in [_referer, base_referer]:
+        try:
+            await loop.run_in_executor(None, lambda r=active_ref: _run_ytdl_hls(r))
+            if os.path.exists(ydl_out) and os.path.getsize(ydl_out) > 1024 * 1024:
+                await _finish_upload(ydl_out, _safe_title, status_msg, uid, chat_id)
+                return
+        except Exception:
+            if os.path.exists(ydl_out):
+                try: os.remove(ydl_out)
+                except: pass
+
+    # FFmpeg fallback with stream repair & resilience flags
+    await safe_edit(status_msg, "⚡ *Retrying stream via FFmpeg core...*", force=True)
+    header_str = f"User-Agent: {_STANDARD_UA}\r\nAccept-Language: {_STANDARD_LANG}\r\nReferer: {_referer}\r\n"
+    ff_cmd = [
+        FFMPEG_PATH, "-y",
+        "-protocol_whitelist", "file,http,https,tcp,tls,crypto,data",
+        "-headers", header_str,
+        "-fflags", "+genpts+discardcorrupt",
+        "-avoid_negative_ts", "make_zero",
+        "-err_detect", "ignore_err",
+        "-i", clean_url,
+        "-c", "copy",
+        "-bsf:a", "aac_adtstoasc",
+        ydl_out
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(*ff_cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+        await proc.wait()
+        if os.path.exists(ydl_out) and os.path.getsize(ydl_out) > 1024 * 1024:
+            await _finish_upload(ydl_out, _safe_title, status_msg, uid, chat_id)
+            return
+    except Exception as e:
+        logging.warning(f"[FFmpeg core error]: {e}")
+
+    await safe_edit(status_msg, "❌ Stream host rejected download (HTTP 403 / token expired).", force=True)
+
+async def _finish_upload(file_path: str, title: str, status_msg, uid: int, chat_id: int):
+    loop  = asyncio.get_running_loop()
+    t0    = time.time()
+    last  = [0.0]
+    clean_title = clean_name(title) or title
+    ext      = os.path.splitext(file_path)[1].lower()
+    is_video = ext in (".mp4", ".mkv", ".webm", ".mov", ".avi", ".ts", ".flv")
+    thumb = ""
+    tmp   = file_path
+    try:
+        if is_video:
+            tmp   = await compress_to_limit(tmp, status_msg)
+            await safe_edit(status_msg, "⚙️ *Step 3/4: Optimising video format...*", force=True)
+            tmp   = await loop.run_in_executor(None, remux_for_streaming, tmp)
+
+            if uid in user_thumbnails and os.path.exists(user_thumbnails[uid]):
+                thumb = user_thumbnails[uid]
+            else:
+                raw_thumb = await loop.run_in_executor(None, extract_thumb, tmp)
+                thumb = prepare_telegram_thumb(raw_thumb) if raw_thumb else ""
+
+            duration, width, height = await loop.run_in_executor(None, get_video_info, tmp)
+        else:
+            duration, width, height = 0, 0, 0
+
+        filesize = os.path.getsize(tmp)
+        await safe_edit(status_msg, f"☁️ *Step 4/4: Uploading {clean_title[:40]} ({fmt_size(filesize)})...*", force=True)
+
+        async def ul_progress(current, total):
+            now = time.time()
+            if now - last[0] < 2.0: return
+            last[0] = now
+            await safe_edit(status_msg,
+                f"☁️ *Step 4/4: Uploading to Vault...*\n*{clean_title[:40]}*\n\n" +
+                progress_bar(current, total) +
+                speed_eta(current, total, now - t0))
+
+        attrs = [DocumentAttributeVideo(duration=duration, w=width, h=height, supports_streaming=True)] if is_video else []
+        input_file = await fast_upload(tgclient, tmp, progress_callback=ul_progress)
+
+        # Automatic FloodWait recovery loop (handles "SendMediaRequest" pauses)
+        sent = None
+        for attempt in range(5):
+            try:
+                sent = await tgclient.send_file(
+                    STORAGE_CHANNEL_ID,
+                    file=input_file,
+                    caption=clean_title,
+                    supports_streaming=is_video,
+                    thumb=thumb if (is_video and thumb) else None,
+                    attributes=attrs,
+                )
+                break
+            except FloodWaitError as fe:
+                _user_flood_until[0] = time.time() + fe.seconds
+                for rem in range(fe.seconds, 0, -5):
+                    await safe_edit(status_msg, f"⏳ *Telegram rate limit active:* Pausing upload for {rem}s...", force=True)
+                    await asyncio.sleep(min(5, rem))
+            except Exception as e:
+                logging.error(f"Upload error attempt {attempt}: {e}")
+                await asyncio.sleep(2)
+
+        if not sent:
+            await safe_edit(status_msg, "❌ Upload failed due to persistent Telegram rate limits.", force=True)
+            return
+
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute("INSERT INTO files (msg_id, name) VALUES (?,?)", (sent.id, clean_title))
+            conn.commit()
+
+        await safe_edit(status_msg, f"✅ *Completed!*\n*{clean_title[:60]}*\n💾 {fmt_size(filesize)}", force=True)
+
+        reply_kb = None
+        if uid in user_thumbnails:
+            reply_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Flush Thumbnail", callback_data="FLUSH_THUMB")]])
+
+        try:
+            await status_msg.get_bot().copy_message(
+                chat_id=chat_id,
+                from_chat_id=STORAGE_CHANNEL_ID,
+                message_id=sent.id,
+                reply_markup=reply_kb
+            )
+        except Exception:
+            try: await tgclient.forward_messages(chat_id, sent.id, from_peer=STORAGE_CHANNEL_ID)
+            except Exception: pass
+    finally:
+        for f in [tmp]:
+            if f and f != file_path and os.path.exists(f):
+                try: os.remove(f)
+                except Exception: pass
+        if file_path and os.path.exists(file_path):
+            try: os.remove(file_path)
+            except Exception: pass
+
+async def _do_dl(url: str, reply_msg, chat_id: int):
+    uid = reply_msg.chat_id
+    now = time.time()
+    rate_hint = f"\n⚠️ _Rate-Limit active ({int(_flood_wait_until[0] - now)}s)_" if now < _flood_wait_until[0] else ""
+    status = await reply_msg.reply_text(f"🔍 *Step 1/4: Analyzing source...*{rate_hint}", parse_mode="Markdown")
+
+    tmp_out = os.path.join(ARIA2C_DOWNLOAD_DIR, f"dl_{uid}_{int(time.time())}.mp4")
+    loop = asyncio.get_running_loop()
+    t0 = time.time()
+    last = [0.0]
+    meta = {}
+
+    cancel_flag = [False]
+    dl_cancel_flags[uid] = cancel_flag
+    CANCEL_KB = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"DL_CANCEL|{uid}")]])
+
+    def hook(d):
+        if cancel_flag[0]: raise Exception("__CANCELLED__")
+        st = d.get("status")
+        if st not in ("downloading", "processing"): return
+
+        done = d.get("downloaded_bytes") or 0
+        total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+
+        if not total and d.get("fragment_count"):
+            done = d.get("fragment_index", 0)
+            total = d.get("fragment_count", 1)
+
+        meta.update(done=done, total=total)
+        now_time = time.time()
+        if now_time - last[0] < 2.0: return
+        last[0] = now_time
+
+        title_lbl = meta.get("title", url)[:40]
+        if total > 0 and d.get("downloaded_bytes"):
+            bar_str = progress_bar(done, total)
+            speed_str = speed_eta(done, total, now_time - t0)
+            text = f"📥 *Step 2/4: Downloading video...*\n*{title_lbl}*\n\n{bar_str}\n{speed_str}"
+        elif d.get("fragment_count"):
+            pct = int((done / total) * 100)
+            bar = "▓" * int(16 * pct / 100) + "░" * (16 - int(16 * pct / 100))
+            text = f"📥 *Step 2/4: Downloading stream...*\n*{title_lbl}*\n\n[{bar}] {pct}% ({done}/{total} chunks)"
+        else:
+            text = f"📥 *Step 2/4: Downloading video...*\n*{title_lbl}*\n\n{fmt_size(done)} downloaded"
+
+        asyncio.run_coroutine_threadsafe(safe_edit(status, text, reply_markup=CANCEL_KB), loop)
+
+    try:
+        await safe_edit(status, "🔍 *Step 1/4: Resolving stream link...*", reply_markup=CANCEL_KB, force=True)
+        real_url, scraped_title, scraper_ref = await asyncio.to_thread(_scrape_real_url, url)
+
+        if not real_url or real_url == url:
+            snatch_res = await universal_snatch(url, status)
+            if snatch_res and snatch_res.get("url"):
+                real_url = snatch_res["url"]
+                scraped_title = snatch_res.get("title") or scraped_title
+                scraper_ref = snatch_res.get("headers", {}).get("Referer", url)
+
+        clean_target_url = real_url.replace("&amp;", "&").replace("\\", "").strip()
+        ref_header = clean_referer(scraper_ref or url)
+
+        # 1. Direct HLS / DASH Stream routing
+        if (".m3u8" in clean_target_url or clean_target_url.split("?")[0].endswith(".m3u8") 
+            or ".mpd" in clean_target_url or "/manifest" in clean_target_url):
+            await safe_edit(status, "📥 *Step 2/4: Stream found (HLS/DASH)!*\nStarting downloader...", reply_markup=CANCEL_KB, force=True)
+            await _do_dl_via_ffmpeg_hls(clean_target_url, status, cancel_flag, uid, chat_id, page_url=url, title=scraped_title, referer=ref_header)
+            return
+
+        # 2. Check if a real CDN / video link was resolved
+        is_dood = ("doodcdn" in clean_target_url) or ("/video~" in clean_target_url) or ("pass_md5" in clean_target_url)
+        path_ext = detect_direct_video_ext(clean_target_url)
+        is_resolved_stream = (clean_target_url != url) and not any(clean_target_url.split("?")[0].endswith(ext) for ext in (".html", ".htm", ".php"))
+
+        if is_dood or path_ext or is_resolved_stream:
+            direct_hdrs = build_direct_headers(clean_target_url, ref_header, _STANDARD_UA)
+            await safe_edit(status, "📥 *Step 2/4: Direct video stream detected (downloading)...*", reply_markup=CANCEL_KB, force=True)
+            if is_dood:
+                await _do_dl_via_cffi(clean_target_url, status, cancel_flag, uid, chat_id, headers=direct_hdrs, title=scraped_title, page_url=ref_header)
+                return
+            ok = await _do_dl_via_aria2c(clean_target_url, tmp_out, status, cancel_flag, headers=direct_hdrs)
+            if ok:
+                await _finish_upload(tmp_out, scraped_title or clean_name(os.path.basename(clean_target_url.rstrip("/"))), status, uid, chat_id)
+                return
+            await _do_dl_via_cffi(clean_target_url, status, cancel_flag, uid, chat_id, headers=direct_hdrs, title=scraped_title, page_url=ref_header)
+            return
+
+        if clean_target_url == url:
+            await safe_edit(status, "❌ Could not extract video stream from this URL (unsupported or protected site).", force=True)
+            return
+
+        # Native yt-dlp core for standard platforms
+        await safe_edit(status, "📥 *Step 2/4: Starting video downloader...*", reply_markup=CANCEL_KB, force=True)
+
+        def run_ydl():
+            ydl_opts = {
+                "format": "bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]/bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
+                "outtmpl": tmp_out,
+                "quiet": True,
+                "noplaylist": True,
+                "progress_hooks": [hook],
+                "merge_output_format": "mp4",
+                "nocheckcertificate": True,
+                "geo_bypass": True,
+                "http_headers": {
+                    "User-Agent": _STANDARD_UA,
+                    "Accept-Language": _STANDARD_LANG,
+                    "Referer": clean_referer(ref_header),
+                },
+                "extractor_args": {
+                    "youtube": {
+                        "player_client": ["default", "web_embedded"],
+                    }
+                },
+            }
+            if COOKIES_FILE: ydl_opts["cookiefile"] = COOKIES_FILE
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                meta["title"] = scraped_title or info.get("title", "Video")
+                meta["duration"] = info.get("duration", 0)
+                meta["width"] = info.get("width", 0)
+                meta["height"] = info.get("height", 0)
+                return info
+
+        try:
+            await loop.run_in_executor(None, run_ydl)
+        except Exception as e:
+            if cancel_flag[0] or "__CANCELLED__" in str(e): raise
+            if clean_target_url != url and detect_direct_video_ext(clean_target_url):
+                await _do_dl_via_cffi(clean_target_url, status, cancel_flag, uid, chat_id, title=scraped_title, page_url=url)
+                return
+            else:
+                await safe_edit(status, "❌ Could not download video from this URL.", force=True)
+                return
+
+        final_title = meta.get("title") or scraped_title or "Video"
+        await _finish_upload(tmp_out, final_title, status, uid, chat_id)
+
+    except asyncio.CancelledError:
+        await safe_edit(status, "⛔ Cancelled.", force=True)
+    except Exception as e:
+        if "__CANCELLED__" in str(e):
+            await safe_edit(status, "⛔ Cancelled.", force=True)
+        else:
+            logging.error(f"DL error: {e}", exc_info=True)
+            await safe_edit(status, f"❌ Error: {str(e)[:180]}", force=True)
+    finally:
+        dl_tasks.pop(uid, None)
+        dl_cancel_flags.pop(uid, None)
+        if os.path.exists(tmp_out):
+            try: os.remove(tmp_out)
+            except Exception: pass
+
+
+# ══════════════════════════════════════════════════════
+#  FAST MULTI-WORKER COVER CHANGER PIPELINE
+# ══════════════════════════════════════════════════════
+async def _update_video_cover(msg: Update, custom_thumb_path: str):
+    uid = msg.chat_id
+    status = await msg.reply_text("⚡ Processing video cover...")
+    raw_video = os.path.join(ARIA2C_DOWNLOAD_DIR, f"cover_swap_{uid}_{int(time.time())}.mp4")
+    staged_msg_id = None
+
+    try:
+        raw_name = (msg.caption or (msg.video.file_name if msg.video else None) or (msg.document.file_name if msg.document else None) or "Video")
+        title = clean_name(raw_name) or raw_name
+
+        await safe_edit(status, "🔄 Refreshing media security token...", force=True)
+        staged = await safe_copy(msg.get_bot(), STORAGE_CHANNEL_ID, msg.chat_id, msg.message_id, disable_notification=True)
+
+        if staged:
+            staged_msg_id = staged.message_id
+            tg_msg = await tgclient.get_messages(STORAGE_CHANNEL_ID, ids=staged_msg_id)
+        else:
+            tg_msg, _ = await resolve_tg_message(msg.chat_id, msg.message_id)
+
+        if not tg_msg or not tg_msg.media:
+            await status.edit_text("❌ Could not read video file.")
+            return
+
+        doc = getattr(tg_msg.media, "document", None)
+        if not doc:
+            await status.edit_text("❌ Not a valid video document.")
+            return
+
+        t0 = time.time()
+        last_edit = [0.0]
+
+        async def dl_prog(current, total):
+            now = time.time()
+            if now - last_edit[0] < 2.0: return
+            last_edit[0] = now
+            text = (
+                f"📥 *Downloading video...*\n*{title[:40]}*\n\n"
+                f"{progress_bar(current, total)}\n"
+                f"{speed_eta(current, total, now - t0)}"
+            )
+            await safe_edit(status, text)
+
+        downloaded = await tgclient.download_media(tg_msg, file=raw_video, progress_callback=dl_prog)
+        if not downloaded or not os.path.exists(raw_video):
+            await status.edit_text("❌ Video download failed.")
+            return
+
+        duration, width, height = 0, 1280, 720
+        for a in getattr(doc, "attributes", []):
+            if isinstance(a, DocumentAttributeVideo):
+                duration, width, height = a.duration, a.w, a.h
+                break
+        if duration == 0: duration, width, height = get_video_info(raw_video)
+
+        attrs = [DocumentAttributeVideo(duration=duration, w=width, h=height, supports_streaming=True)]
+        valid_thumb = prepare_telegram_thumb(custom_thumb_path)
+        t1 = time.time()
+        last_edit[0] = 0.0
+
+        async def ul_prog(current, total):
+            now = time.time()
+            if now - last_edit[0] < 2.0: return
+            last_edit[0] = now
+            text = (
+                f"☁️ *Uploading with new cover...*\n*{title[:40]}*\n\n"
+                f"{progress_bar(current, total)}\n"
+                f"{speed_eta(current, total, now - t1)}"
+            )
+            await safe_edit(status, text)
+
+        input_file = await fast_upload(tgclient, raw_video, progress_callback=ul_prog)
+
+        sent = await tgclient.send_file(
+            STORAGE_CHANNEL_ID,
+            file=input_file,
+            caption=title,
+            supports_streaming=True,
+            thumb=valid_thumb,
+            attributes=attrs,
+        )
+
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute("INSERT INTO files (msg_id, name) VALUES (?,?)", (sent.id, title))
+            conn.commit()
+
+        if staged_msg_id:
+            try: await tgclient.delete_messages(STORAGE_CHANNEL_ID, staged_msg_id)
+            except Exception: pass
+
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Flush Thumbnail", callback_data="FLUSH_THUMB")]])
+        try:
+            await msg.get_bot().copy_message(
+                chat_id=msg.chat_id,
+                from_chat_id=STORAGE_CHANNEL_ID,
+                message_id=sent.id,
+                reply_markup=kb,
+            )
+        except Exception:
+            await tgclient.forward_messages(msg.chat_id, sent.id, from_peer=STORAGE_CHANNEL_ID)
+
+        await status.edit_text("✅ Cover updated!")
+    except Exception as e:
+        logging.error(f"Cover update error: {e}")
+        await status.edit_text(f"❌ Failed to update cover: {e}")
+    finally:
+        if os.path.exists(raw_video):
+            try: os.remove(raw_video)
+            except Exception: pass
+
+
+# ══════════════════════════════════════════════════════
+#  HIGH-SPEED BATCH AUTO-NAMING PIPELINE
+# ══════════════════════════════════════════════════════
+async def extract_episode_name(msg, uid: int) -> str:
+    found_name = None
+
+    if msg.video and getattr(msg.video, "file_name", None):
+        found_name = msg.video.file_name
+    elif msg.document and getattr(msg.document, "file_name", None):
+        found_name = msg.document.file_name
+
+    if not found_name and msg.caption:
+        found_name = msg.caption.strip().split("\n")[0]
+
+    if not found_name:
+        size = (msg.video.file_size if msg.video else (msg.document.file_size if msg.document else 0)) or 0
+        duration = (msg.video.duration if msg.video else 0) or 0
+
+        if size > 0:
+            try:
+                conn = get_db(); cur = conn.cursor()
+                if duration > 0:
+                    cur.execute("SELECT name FROM file_footprints WHERE file_size=? AND duration=? LIMIT 1", (size, duration))
+                else:
+                    cur.execute("SELECT name FROM file_footprints WHERE file_size=? LIMIT 1", (size,))
+                row = cur.fetchone(); conn.close()
+                if row and row[0]:
+                    found_name = row[0]
+            except Exception: pass
+
+    if not found_name or found_name.lower() in ("video", "file", "unknown"):
+        prefix = user_series_prefix.get(uid, "Episode")
+        curr_ep = episode_counters.get(uid, 1)
+        found_name = f"{prefix} E{curr_ep:02d}.mp4"
+        episode_counters[uid] = curr_ep + 1
+
+    return found_name
+
+async def batch_resend_worker(uid: int, bot):
+    q = batch_queues[uid]
+    try:
+        while not q.empty():
+            msg = await q.get()
+            try:
+                resolved_name = await extract_episode_name(msg, uid)
+                size = (msg.video.file_size if msg.video else (msg.document.file_size if msg.document else 0)) or 0
+                dur = (msg.video.duration if msg.video else 0) or 0
+
+                stored = None
+                try:
+                    stored = await safe_copy(
+                        bot, STORAGE_CHANNEL_ID,
+                        msg.chat_id, msg.message_id,
+                        caption=f"📁 `{resolved_name}`",
+                        parse_mode="Markdown",
+                        disable_notification=True
+                    )
+                except Exception: pass
+
+                stored_msg_id = None
+                if stored is not None:
+                    stored_msg_id = stored.message_id
+                else:
+                    tg_msg, dl_client = await resolve_tg_message(msg.chat_id, msg.message_id)
+                    if tg_msg and tg_msg.media:
+                        sent = await dl_client.send_file(
+                            STORAGE_CHANNEL_ID,
+                            tg_msg,
+                            caption=f"📁 `{resolved_name}`"
+                        )
+                        stored_msg_id = sent.id
+
+                if stored_msg_id:
+                    with get_db() as conn:
+                        cur = conn.cursor()
+                        cur.execute("INSERT INTO files (msg_id, name) VALUES (?,?)", (stored_msg_id, resolved_name))
+                        if size > 0:
+                            cur.execute("INSERT INTO file_footprints (file_size, duration, name) VALUES (?,?,?)", (size, dur, resolved_name))
+                        conn.commit()
+
+                    sent_user = None
+                    try:
+                        sent_user = await safe_copy(
+                            bot, uid,
+                            STORAGE_CHANNEL_ID, stored_msg_id,
+                            caption=f"📁 `{resolved_name}`",
+                            parse_mode="Markdown"
+                        )
+                    except Exception: pass
+
+                    if sent_user is None:
+                        try:
+                            await tgclient.forward_messages(uid, stored_msg_id, from_peer=STORAGE_CHANNEL_ID)
+                        except Exception: pass
+
+            except Exception as e:
+                logging.error(f"batch_resend_worker error: {e}", exc_info=True)
+            finally:
+                q.task_done()
+                await asyncio.sleep(0.05)
+    finally:
+        batch_queues.pop(uid, None)
+
+
+# ══════════════════════════════════════════════════════
+#  FORWARD FILE SAVE WORKER
+# ══════════════════════════════════════════════════════
+async def _save_worker(uid: int):
+    q = save_queues[uid]
+    try:
+        while True:
+            job = await asyncio.wait_for(q.get(), timeout=60)
+            try: await _do_save(**job)
+            except Exception as e: logging.error("save_worker: " + str(e))
+            finally: q.task_done()
+            await asyncio.sleep(0.5)
+    except asyncio.TimeoutError: pass
+    finally:
+        save_queues.pop(uid, None)
+        save_workers.pop(uid, None)
+
+async def _do_save(update: Update, context: ContextTypes.DEFAULT_TYPE, name: str):
+    msg = update.message
+    try:
+        stored = None
+        try:
+            stored = await safe_copy(context.bot, STORAGE_CHANNEL_ID, msg.chat_id, msg.message_id, disable_notification=True)
+        except Exception: pass
+
+        if stored is None:
+            tg_msg, dl_client = await resolve_tg_message(msg.chat_id, msg.message_id)
+            if tg_msg is None or tg_msg.media is None:
+                await msg.reply_text("Could not access this file.")
+                return
+            sent = await dl_client.send_file(STORAGE_CHANNEL_ID, tg_msg, caption=name)
+            stored_id = sent.id
+        else:
+            stored_id = stored.message_id
+
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute("INSERT INTO files (msg_id, name) VALUES (?,?)", (stored_id, name))
+            conn.commit()
+            new_id = cur.lastrowid
+
+        await safe_copy(context.bot, msg.chat_id, STORAGE_CHANNEL_ID, stored_id, disable_notification=True)
+        if not SILENT_MODE[0]:
+            await msg.reply_text(f"Saved {name} (ID {new_id})")
+    except Exception as e:
+        logging.error(f"_do_save error: {e}")
+        await msg.reply_text("Save failed: " + str(e))
+
+
+# ══════════════════════════════════════════════════════
+#  MP3 EXTRACTION
+# ══════════════════════════════════════════════════════
+async def mp3_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if c.args:
+        await _do_mp3_url(c.args[0], u.message, u.effective_chat.id)
+    else:
+        pending_mp3[u.effective_user.id] = True
+        await u.message.reply_text("Send or forward the video you want the MP3 extracted from:")
+
+async def _do_mp3_url(url: str, reply_msg, chat_id: int):
+    uid    = reply_msg.chat_id
+    status = await reply_msg.reply_text("🔍 *Resolving audio stream...*")
+    tmp    = os.path.join(ARIA2C_DOWNLOAD_DIR, f"mp3_{uid}.mp3")
+    loop   = asyncio.get_running_loop()
+    t0     = time.time()
+    last   = [0.0]
+    meta   = {}
+
+    def hook(d):
+        if d.get("status") != "downloading": return
+        done  = d.get("downloaded_bytes") or 0
+        total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+        meta.update(done=done, total=total)
+        now = time.time()
+        if now - last[0] < 2.0: return
+        last[0] = now
+        asyncio.run_coroutine_threadsafe(
+            safe_edit(status, "🎵 *Extracting MP3:*\n" + meta.get("title", url)[:40] + "\n\n" + progress_bar(done, total) + speed_eta(done, total, now - t0)),
+            loop)
+
+    def run_ydl():
+        ydl_opts = {
+            "format": "bestaudio/best",
+            "outtmpl": os.path.join(ARIA2C_DOWNLOAD_DIR, f"mp3_{uid}.%(ext)s"),
+            "quiet": True,
+            "noplaylist": True,
+            "progress_hooks": [hook],
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }],
+            "nocheckcertificate": True,
+            "geo_bypass": True,
+        }
+        if COOKIES_FILE: ydl_opts["cookiefile"] = COOKIES_FILE
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            meta["title"] = info.get("title", "Audio")
+            return info
+
+    try:
+        await safe_edit(status, "🎵 *Starting audio extraction...*", force=True)
+        await loop.run_in_executor(None, run_ydl)
+        if not os.path.exists(tmp): return await safe_edit(status, "❌ MP3 extraction failed.", force=True)
+        title    = meta.get("title", "Audio")
+        filesize = os.path.getsize(tmp)
+        await safe_edit(status, f"☁️ *Uploading {title[:40]} ({fmt_size(filesize)})...*", force=True)
+
+        input_file = await fast_upload(tgclient, tmp)
+        sent = await tgclient.send_file(STORAGE_CHANNEL_ID, file=input_file, caption=title, attributes=[])
+
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute("INSERT INTO files (msg_id, name) VALUES (?,?)", (sent.id, title))
+            conn.commit()
+
+        await status.get_bot().copy_message(chat_id=chat_id, from_chat_id=STORAGE_CHANNEL_ID, message_id=sent.id)
+        await safe_edit(status, f"✅ *{title}*", force=True)
+    except Exception as e:
+        await safe_edit(status, "❌ " + str(e), force=True)
+    finally:
+        if os.path.exists(tmp):
+            try: os.remove(tmp)
+            except Exception: pass
+
+async def _do_mp3_from_file(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    msg    = u.message
+    uid    = u.effective_user.id
+    status = await msg.reply_text("📥 *Downloading file for MP3 conversion...*")
+    src_path = None
+    out_path = os.path.join(ARIA2C_DOWNLOAD_DIR, f"mp3_{uid}.mp3")
+    try:
+        tg_msg, dl_client = await resolve_tg_message(msg.chat_id, msg.message_id)
+        if tg_msg is None or tg_msg.media is None:
+            await status.edit_text("Could not access this file.")
+            return
+
+        raw  = (msg.caption or (msg.video.file_name if msg.video else None) or (msg.document.file_name if msg.document else None) or "Audio")
+        title = clean_name(raw) or raw or "Audio"
+        title = re.sub(r"\.(mp4|mkv|avi|mov|webm)$", "", title, flags=re.IGNORECASE).strip()
+
+        loop = asyncio.get_running_loop()
+        src_path = await dl_client.download_media(tg_msg, file=f"mp3_{uid}_src")
+        if not src_path: return await status.edit_text("Download failed.")
+
+        await safe_edit(status, "⚙️ *Converting to MP3 via FFmpeg...*", force=True)
+        cmd = [FFMPEG_PATH, "-y", "-i", src_path, "-vn", "-acodec", "mp3", "-ab", "192k", out_path]
+        await loop.run_in_executor(None, lambda: subprocess.run(cmd, capture_output=True, timeout=600))
+        if not os.path.exists(out_path): return await status.edit_text("MP3 conversion failed.")
+
+        filesize = os.path.getsize(out_path)
+        await safe_edit(status, f"☁️ *Uploading {title[:40]} ({fmt_size(filesize)})...*", force=True)
+
+        input_file = await fast_upload(tgclient, out_path)
+        sent = await tgclient.send_file(STORAGE_CHANNEL_ID, file=input_file, caption=title, attributes=[])
+
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute("INSERT INTO files (msg_id, name) VALUES (?,?)", (sent.id, title))
+            conn.commit()
+
+        await c.bot.copy_message(chat_id=u.effective_chat.id, from_chat_id=STORAGE_CHANNEL_ID, message_id=sent.id)
+        await safe_edit(status, f"✅ *{title}*", force=True)
+    except Exception as e:
+        await status.edit_text("❌ " + str(e))
+    finally:
+        for f in [src_path, out_path]:
+            if f and os.path.exists(f):
+                try: os.remove(f)
+                except Exception: pass
+
+
+# ══════════════════════════════════════════════════════
+#  BOT COMMANDS & HANDLERS
+# ══════════════════════════════════════════════════════
+async def series_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    uid = u.effective_user.id
+    if not c.args:
+        curr = user_series_prefix.get(uid, "Episode")
+        await u.message.reply_text(f"Current series prefix: `{curr}`\nUsage: `/series [Show Name]`\nExample: `/series Naruto Shippuden S10`", parse_mode="Markdown")
+        return
+    prefix = " ".join(c.args)
+    user_series_prefix[uid] = prefix
+    episode_counters[uid] = 1
+    await u.message.reply_text(f"✅ Series set to: *{prefix}*\nNext unnamed files will start at: *E01*", parse_mode="Markdown")
+
+async def resetep_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    uid = u.effective_user.id
+    num = int(c.args[0]) if (c.args and c.args[0].isdigit()) else 1
+    episode_counters[uid] = num
+    await u.message.reply_text(f"✅ Next episode counter set to: *E{num:02d}*", parse_mode="Markdown")
+
+async def limits_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    now = time.time()
+    bot_wait = max(0, int(_flood_wait_until[0] - now))
+    user_wait = max(0, int(_user_flood_until[0] - now))
+
+    lines = ["📊 *Telegram & Bot Status Report*\n"]
+    lines.append(f"🤖 *Bot Message-Edits:* ⚠️ Paused for *{bot_wait}s* ({bot_wait // 60}m {bot_wait % 60}s)" if bot_wait > 0 else "🤖 *Bot Message-Edits:* ✅ *Ready* (No restrictions)")
+    lines.append(f"👤 *Telethon User Client:* ⚠️ FloodWait for *{user_wait}s*" if user_wait > 0 else "👤 *Telethon User Client:* ✅ *Ready* (Uploads up to 2 GB active)")
+    lines.append(f"\n📥 *Active Downloads:* {len(dl_tasks)}")
+    await u.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+async def send_vault_page(target, page: int, edit: bool = False):
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM files")
+        total = cur.fetchone()[0]
+        cur.execute("SELECT id, name FROM files ORDER BY id DESC LIMIT ? OFFSET ?", (FILES_PER_PAGE, page * FILES_PER_PAGE))
+        files = cur.fetchall()
+
+    if not files:
+        txt = "Vault is empty."
+        if edit: await target.edit_message_text(txt)
+        else: await target.reply_text(txt)
+        return
+
+    pages = max(1, (total - 1) // FILES_PER_PAGE + 1)
+    text = f"Vault — {total} file(s) (Page {page+1}/{pages})"
+    rows = [[InlineKeyboardButton(f"  {r[1][:40]}", callback_data=f"FILE|{r[0]}")] for r in files]
+    nav = []
+    if page > 0: nav.append(InlineKeyboardButton("◀️", callback_data=f"PAGE|{page-1}"))
+    if (page+1)*FILES_PER_PAGE < total: nav.append(InlineKeyboardButton("▶️", callback_data=f"PAGE|{page+1}"))
+    if nav: rows.append(nav)
+    kb = InlineKeyboardMarkup(rows)
+
+    if edit: await target.edit_message_text(text, reply_markup=kb)
+    else: await target.reply_text(text, reply_markup=kb)
+
+def file_kb(tid):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📥 Get", callback_data=f"GET|{tid}"),
+         InlineKeyboardButton("✏️ Rename", callback_data=f"REN|{tid}"),
+         InlineKeyboardButton("🗑 Delete", callback_data=f"DEL|{tid}")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="BACK")],
+    ])
+
+async def start_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    await u.message.reply_text(
+        "*Titan Vault & Batch Auto-Renamer*\n\n"
+        "Forward up to 200+ episodes at once to instantly receive them with real filenames!\n\n"
+        "`/series [name]` — Set series name for unnamed files\n"
+        "`/ep [num]` — Set starting episode number\n"
+        "`/files` — browse vault\n"
+        "`/dl [url]` — download link up to 2 GB\n"
+        "`/thumb` — set custom thumbnail\n"
+        "`/viewthumb` — preview active thumbnail\n"
+        "`/flush` — clear thumbnail\n"
+        "`/limits` — check rate limit status\n"
+        "`/search [q]` — find files\n"
+        "`/help` — show all commands",
+        parse_mode="Markdown"
+    )
+
+async def help_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    owner = u.effective_user.id == OWNER_ID
+    lines = [
+        "*Titan Vault Commands*\n",
+        "`/series [name]` — Set show name for unnamed batches",
+        "`/ep [num]` — Set starting episode number",
+        "`/files` — browse vault",
+        "`/dl [url]` — download & store (up to 2 GB)",
+        "`/limits` — check Telegram rate limit & timers",
+        "`/mp3 [url]` — extract & store as MP3 from URL",
+        "`/mp3` — send/forward a video to extract MP3 from",
+        "`/thumb` — set custom thumbnail for videos",
+        "`/viewthumb` — preview active custom thumbnail",
+        "`/flush` or `/delthumb` — clear custom thumbnail",
+        "`/search [q]` — search files",
+        "`/rename [name]` — rename last file",
+        "`/status` — vault stats",
+        "`/quiet` — toggle silent saves",
+    ]
+    if owner: lines += ["\n*Owner*", "`/session` — get Telethon session string"]
+    await u.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+async def status_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*), MAX(added_at) FROM files")
+        count, latest = cur.fetchone()
+    thumb_status = "✅ Custom Set" if u.effective_user.id in user_thumbnails else "Auto-generated"
+    await u.message.reply_text(f"*Vault Status*\n\nFiles: *{count}*\nLast added: {(latest or 'never')[:16]}\nUpload limit: 2 GB\nThumbnail: *{thumb_status}*", parse_mode="Markdown")
+
+async def files_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    await send_vault_page(u.message, 0)
+
+async def search_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if not c.args: return await u.message.reply_text("Usage: `/search query`", parse_mode="Markdown")
+    q = " ".join(c.args)
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id, name FROM files WHERE LOWER(name) LIKE ? ORDER BY id DESC LIMIT 25", (f"%{q.lower()}%",))
+        rows = cur.fetchall()
+    if not rows: return await u.message.reply_text(f'No results for "{q}".')
+    kb = [[InlineKeyboardButton(f"  {r[1][:40]}", callback_data=f"FILE|{r[0]}")] for r in rows]
+    await u.message.reply_text(f'*{len(rows)} result(s)* for "{q}"', reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+
+async def quiet_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(u.effective_user.id): return
+    SILENT_MODE[0] = not SILENT_MODE[0]
+    await u.message.reply_text("Quiet mode: " + ("ON" if SILENT_MODE[0] else "OFF"))
+
+async def done_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    pending_rename.pop(u.effective_user.id, None)
+    pending_thumb.pop(u.effective_user.id, None)
+    await u.message.reply_text("Cleared pending actions.")
+
+async def rename_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    uid = u.effective_user.id
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id, name FROM files ORDER BY id DESC LIMIT 1")
+        row = cur.fetchone()
+    if not row: return await u.message.reply_text("No files saved yet.")
+    pending_rename[uid] = {"db_id": row[0]}
+    await u.message.reply_text("Send the new name for: " + row[1])
+
+async def session_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(u.effective_user.id): return
+    string = tgclient.session.save()
+    await u.message.reply_text(f"*Your session string*:\n\n`{string}`", parse_mode="Markdown")
+
+async def _do_rename(bot, reply_target, db_id: int, new_name: str, echo_chat=None):
+    with get_db() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT msg_id FROM files WHERE id=?", (db_id,))
+        row = cur.fetchone()
+    if not row: return await reply_target.reply_text("File not found.")
+    try:
+        old_msg = await tgclient.get_messages(STORAGE_CHANNEL_ID, ids=row[0])
+        new_msg = await tgclient.send_message(STORAGE_CHANNEL_ID, new_name, file=old_msg.media)
+        await tgclient.delete_messages(STORAGE_CHANNEL_ID, row[0])
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute("UPDATE files SET msg_id=?, name=? WHERE id=?", (new_msg.id, new_name, db_id))
+            conn.commit()
+        await reply_target.reply_text("✅ " + new_name)
+        if echo_chat:
+            await bot.copy_message(chat_id=echo_chat, from_chat_id=STORAGE_CHANNEL_ID, message_id=new_msg.id)
+    except Exception as e:
+        await reply_target.reply_text("Rename failed: " + str(e))
+
+async def dl_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if not c.args: return await u.message.reply_text("Usage: `/dl [url]`", parse_mode="Markdown")
+    uid = u.effective_chat.id
+    if uid in dl_tasks and not dl_tasks[uid].done():
+        dl_tasks[uid].cancel()
+        await asyncio.sleep(0.3)
+    task = asyncio.create_task(_do_dl(c.args[0], u.message, u.effective_chat.id))
+    dl_tasks[uid] = task
+    await task
+
+async def thumb_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    uid = u.effective_user.id
+    reply = u.message.reply_to_message
+
+    if reply and (reply.photo or (reply.document and getattr(reply.document, "mime_type", "").startswith("image/"))):
+        raw_thumb = f"thumb_{uid}.jpg"
+        f = await (reply.photo[-1] if reply.photo else reply.document).get_file()
+        await f.download_to_drive(raw_thumb)
+        scaled = prepare_telegram_thumb(raw_thumb)
+        user_thumbnails[uid] = scaled
+        pending_thumb.pop(uid, None)
+
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("👁 View Thumbnail", callback_data="VIEW_THUMB"), InlineKeyboardButton("🗑 Flush Thumbnail", callback_data="FLUSH_THUMB")]])
+        await u.message.reply_text("✅ Custom thumbnail saved from reply!", reply_markup=kb)
+        return
+
+    pending_thumb[uid] = True
+    await u.message.reply_text("🖼 Send me the photo you want to use as your thumbnail.")
+
+async def viewthumb_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    uid = u.effective_user.id
+    if uid in user_thumbnails and os.path.exists(user_thumbnails[uid]):
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Flush Thumbnail", callback_data="FLUSH_THUMB")]])
+        with open(user_thumbnails[uid], "rb") as fh:
+            await u.message.reply_photo(photo=fh, caption="Active thumbnail:", reply_markup=kb)
+    else:
+        await u.message.reply_text("No custom thumbnail is active.")
+
+async def flush_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    uid = u.effective_user.id
+    pending_thumb.pop(uid, None)
+    old = user_thumbnails.pop(uid, None)
+    if old and os.path.exists(old):
+        try: os.remove(old)
+        except Exception: pass
+    await u.message.reply_text("🗑 Thumbnail flushed!")
+
+
+# ══════════════════════════════════════════════════════
+#  MESSAGE DISPATCHER & BUTTON HANDLER
+# ══════════════════════════════════════════════════════
+async def on_message(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    msg = u.message
+    if not msg: return
+    uid = u.effective_user.id
+
+    is_image = bool(msg.photo or (msg.document and getattr(msg.document, "mime_type", "").startswith("image/")))
+    if pending_thumb.get(uid) and is_image:
+        raw_thumb = f"thumb_raw_{uid}.jpg"
+        f = await (msg.photo[-1] if msg.photo else msg.document).get_file()
+        await f.download_to_drive(raw_thumb)
+        scaled = prepare_telegram_thumb(raw_thumb)
+        user_thumbnails[uid] = scaled
+        pending_thumb.pop(uid, None)
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("👁 View", callback_data="VIEW_THUMB"), InlineKeyboardButton("🗑 Flush", callback_data="FLUSH_THUMB")]])
+        await msg.reply_text("✅ Custom thumbnail saved!", reply_markup=kb)
+        return
+
+    if pending_mp3.get(uid) and (msg.video or msg.document):
+        pending_mp3.pop(uid)
+        await _do_mp3_from_file(u, c)
+        return
+
+    if pending_rename.get(uid, {}).get("mode") == "search" and msg.text:
+        pending_rename.pop(uid)
+        q = msg.text.strip()
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT id, name FROM files WHERE LOWER(name) LIKE ? ORDER BY id DESC LIMIT 25", (f"%{q.lower()}%",))
+            rows = cur.fetchall()
+        if not rows: return await msg.reply_text(f'No results for "{q}".')
+        kb = [[InlineKeyboardButton(f"  {r[1][:40]}", callback_data=f"FILE|{r[0]}")] for r in rows]
+        await msg.reply_text(f'*{len(rows)} result(s)* for "{q}"', reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        return
+
+    if "db_id" in pending_rename.get(uid, {}) and msg.text:
+        data = pending_rename.pop(uid)
+        await _do_rename(c.bot, msg, data["db_id"], msg.text.strip(), echo_chat=u.effective_chat.id)
+        return
+
+    if msg.text and re.match(r"https?://", msg.text.strip()) and not getattr(msg, "forward_origin", None):
+        uid = u.effective_chat.id
+        new_url = msg.text.strip()
+        if uid in dl_tasks and not dl_tasks[uid].done():
+            active_flag = dl_cancel_flags.get(uid)
+            if active_flag and len(active_flag) > 1 and active_flag[1] == new_url: return
+            dl_tasks[uid].cancel()
+            await asyncio.sleep(0.3)
+        task = asyncio.create_task(_do_dl(new_url, msg, uid))
+        dl_tasks[uid] = task
+        return
+
+    if msg.video or (msg.document and getattr(msg.document, "mime_type", "").startswith("video/")):
+        if uid in user_thumbnails and os.path.exists(user_thumbnails[uid]):
+            await _update_video_cover(msg, user_thumbnails[uid])
+            return
+
+        if uid not in batch_queues:
+            batch_queues[uid] = asyncio.Queue()
+            asyncio.create_task(batch_resend_worker(uid, c.bot))
+
+        await batch_queues[uid].put(msg)
+        return
+
+    if msg.photo or msg.audio or msg.animation or msg.document or (msg.text and msg.forward_origin):
+        raw = (msg.caption
+               or (msg.document.file_name if msg.document else None)
+               or (msg.audio.file_name if msg.audio else None)
+               or "File")
+        name = clean_name(raw) or raw or "File"
+
+        if uid not in save_queues: save_queues[uid] = asyncio.Queue()
+        if uid not in save_workers or save_workers[uid].done(): save_workers[uid] = asyncio.create_task(_save_worker(uid))
+        await save_queues[uid].put({"update": u, "context": c, "name": name})
+        return
+
+async def button_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    q = u.callback_query
+    try: await q.answer()
+    except Exception: pass
+    uid  = q.from_user.id
+    data = q.data or ""
+
+    if data == "BACK": return await send_vault_page(q, 0, edit=True)
+    if data == "SEARCH":
+        pending_rename[uid] = {"mode": "search"}
+        return await q.edit_message_text("Send your search query:")
+
+    if data == "FLUSH_THUMB":
+        pending_thumb.pop(uid, None)
+        old = user_thumbnails.pop(uid, None)
+        if old and os.path.exists(old):
+            try: os.remove(old)
+            except Exception: pass
+        await q.message.reply_text("🗑 Custom thumbnail flushed!")
+        return
+
+    if data == "VIEW_THUMB":
+        if uid in user_thumbnails and os.path.exists(user_thumbnails[uid]):
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Flush Thumbnail", callback_data="FLUSH_THUMB")]])
+            with open(user_thumbnails[uid], "rb") as fh:
+                await q.message.reply_photo(photo=fh, caption="Active thumbnail:", reply_markup=kb)
+        else:
+            await q.message.reply_text("No custom thumbnail currently active.")
+        return
+
+    if "|" not in data: return
+    act, tid = data.split("|", 1)
+
+    if act == "PAGE": return await send_vault_page(q, int(tid), edit=True)
+    if act == "DL_CANCEL":
+        uid = int(tid)
+        flag = dl_cancel_flags.get(uid)
+        if flag: flag[0] = True
+        task = dl_tasks.pop(uid, None)
+        if task: task.cancel()
+        return
+
+    if act == "FILE":
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT name, added_at FROM files WHERE id=?", (int(tid),))
+            row = cur.fetchone()
+        if not row: return await q.edit_message_text("Not found.")
+        await q.edit_message_text(f"*{row[0]}*\nID {tid} • {(row[1] or '')[:16]}", reply_markup=file_kb(tid), parse_mode="Markdown")
+        return
+
+    if act == "GET":
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT msg_id FROM files WHERE id=?", (int(tid),))
+            row = cur.fetchone()
+        if not row: return await q.answer("Not found!", show_alert=True)
+        try:
+            await c.bot.copy_message(chat_id=q.message.chat_id, from_chat_id=STORAGE_CHANNEL_ID, message_id=row[0])
+        except Exception:
+            try: await tgclient.forward_messages(q.message.chat_id, row[0], from_peer=STORAGE_CHANNEL_ID)
+            except Exception as e: await q.answer(str(e), show_alert=True)
+        return
+
+    if act == "DEL":
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM files WHERE id=?", (int(tid),))
+            conn.commit()
+        await q.edit_message_text("🗑 Deleted.")
+        return
+
+    if act == "REN":
+        with get_db() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT msg_id, name FROM files WHERE id=?", (int(tid),))
+            row = cur.fetchone()
+        if not row: return await q.answer("Not found.", show_alert=True)
+        pending_rename[uid] = {"db_id": int(tid), "msg_id": row[0]}
+        await q.edit_message_text(f"*Rename*\n\nCurrent: _{row[1]}_\n\nSend the new name:", parse_mode="Markdown")
+        return
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if isinstance(context.error, (NetworkError, TimedOut)):
+        logging.warning(f"[Telegram Network] Transient connection blip: {context.error}")
+        return
+    logging.error(f"Update error: {context.error}", exc_info=context.error)
+
+
+# ══════════════════════════════════════════════════════
+#  MAIN ENTRYPOINT
+# ══════════════════════════════════════════════════════
+async def main():
+    init_db()
+
+    await tgclient.start()
+    me = await tgclient.get_me()
+    print(f"{Fore.CYAN}Telethon user logged in as: {me.first_name}{Style.RESET_ALL}")
+    print(f"{Fore.CYAN}Connected to DC{tgclient.session.dc_id} (Parallel upload acceleration enabled){Style.RESET_ALL}")
+
+    await tgbot.start(bot_token=BOT_TOKEN)
+    bot_me = await tgbot.get_me()
+    print(f"{Fore.CYAN}Telethon bot logged in as: {bot_me.username}{Style.RESET_ALL}")
+
+    app = (ApplicationBuilder()
+           .token(BOT_TOKEN)
+           .read_timeout(30)
+           .write_timeout(300)
+           .connect_timeout(30)
+           .build())
+
+    commands = [
+        BotCommand("start", "Start the bot"),
+        BotCommand("series", "Set series name for auto-naming"),
+        BotCommand("ep", "Set starting episode counter"),
+        BotCommand("files", "Browse vault files"),
+        BotCommand("dl", "Download video from URL"),
+        BotCommand("thumb", "Set custom video thumbnail"),
+        BotCommand("viewthumb", "View active thumbnail"),
+        BotCommand("flush", "Flush/delete custom thumbnail"),
+        BotCommand("delthumb", "Same as /flush"),
+        BotCommand("mp3", "Extract MP3 from video or URL"),
+        BotCommand("search", "Search files in vault"),
+        BotCommand("rename", "Rename last file"),
+        BotCommand("limits", "Check rate limits and status"),
+        BotCommand("status", "Check vault statistics"),
+        BotCommand("help", "Help & all commands"),
+    ]
+    try:
+        await app.bot.set_my_commands(commands)
+    except Exception as e:
+        logging.warning(f"Could not register commands with Bot API: {e}")
+
+    app.add_error_handler(error_handler)
+
+    app.add_handler(CommandHandler("start",     start_cmd))
+    app.add_handler(CommandHandler("series",    series_cmd))
+    app.add_handler(CommandHandler(["ep", "resetep"], resetep_cmd))
+    app.add_handler(CommandHandler("help",      help_cmd))
+    app.add_handler(CommandHandler("status",    status_cmd))
+    app.add_handler(CommandHandler("limits",    limits_cmd))
+    app.add_handler(CommandHandler("files",     files_cmd))
+    app.add_handler(CommandHandler("search",    search_cmd))
+    app.add_handler(CommandHandler(["dl", "snatch"], dl_cmd))
+    app.add_handler(CommandHandler("mp3",       mp3_cmd))
+    app.add_handler(CommandHandler("thumb",     thumb_cmd))
+    app.add_handler(CommandHandler("viewthumb", viewthumb_cmd))
+    app.add_handler(CommandHandler(["flush", "flushthumb", "delthumb"], flush_cmd))
+    app.add_handler(CommandHandler("done",      done_cmd))
+    app.add_handler(CommandHandler("rename",    rename_cmd))
+    app.add_handler(CommandHandler("session",   session_cmd))
+    app.add_handler(CommandHandler("quiet",     quiet_cmd))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, on_message))
+
+    print(f"{Fore.GREEN}+----------------------------------+")
+    print(f"|   TITAN VAULT  --  online        |")
+    print(f"+----------------------------------+{Style.RESET_ALL}")
+
+    async with app:
+        await app.start()
+        await app.updater.start_polling()
+        try:
+            await tgclient.run_until_disconnected()
+        finally:
+            await app.updater.stop()
+            await app.stop()
+    await tgbot.disconnect()
+
+if __name__ == "__main__":
+    asyncio.run(main())
