@@ -2385,6 +2385,20 @@ def _nm_find_binary() -> str:
     _NM_BIN_CACHE[0], _NM_BIN_CACHE[1] = path, True
     return path
 
+def _nm_find_ffmpeg() -> str:
+    """Absolute ffmpeg path to hand to the exe (--ffmpeg-binary-path), or "".
+    The bot itself runs plain "ffmpeg"; on Windows that also resolves from the script/current folder,
+    which a separately launched exe does not search - so resolve it here and pass it explicitly."""
+    exe = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
+    cands = []
+    w = shutil.which(FFMPEG_PATH)
+    if w: cands.append(w)
+    if os.path.isabs(FFMPEG_PATH): cands.append(FFMPEG_PATH)
+    for d in (_SCRIPT_DIR, os.getcwd()):
+        cands.append(os.path.join(d, exe))
+    hit = next((c for c in cands if c and os.path.isfile(c)), "")
+    return os.path.abspath(hit) if hit else ""
+
 def _pick_policy_variant(variants: list):
     """Download policy: highest height <=1080; only when nothing is <=1080, the CLOSEST higher
     height. Returns (width, height) or None. Same policy as YDL_FORMAT."""
@@ -2445,10 +2459,11 @@ def _probe_stream_kinds(path: str) -> list:
     except Exception:
         return []
 
-def _nm_probe_args(url: str, probe_dir: str, headers: dict) -> list:
+def _nm_probe_args(url: str, probe_dir: str, headers: dict, ffmpeg_bin: str = "") -> list:
     """Probe run: the exe fetches and parses the manifest itself, writes meta.json, downloads nothing."""
     args = [url, "--save-dir", probe_dir, "--save-name", "probe", "--tmp-dir", os.path.join(probe_dir, "tmp"),
             "--http-request-timeout", "30", "--no-log", "--no-ansi-color", "--skip-download", "--write-meta-json"]
+    if ffmpeg_bin: args += ["--ffmpeg-binary-path", ffmpeg_bin]
     for k, v in headers.items():
         v = re.sub(r"[\r\n]", "", str(v)).strip()
         if v: args += ["-H", f"{k}: {v}"]
@@ -2537,13 +2552,15 @@ async def _do_dl_via_nm3u8dl(url: str, status_msg, cancel_flag: list, uid: int, 
     job_dir = os.path.join(ARIA2C_DOWNLOAD_DIR, f"nm_{uid}_{int(time.time())}")
     probe_dir = os.path.join(job_dir, "probe")
     os.makedirs(probe_dir, exist_ok=True)
-    ffbin = shutil.which(FFMPEG_PATH) or ""
+    ffbin = _nm_find_ffmpeg()
+    if not ffbin:
+        _diag(uid, leg, "ffmpeg", "not located by the bot (the exe searches its own PATH)")
     last_edit = [0.0]
     try:
         # ---- 1) probe ----
         await safe_edit(status_msg, f"🔍 *Step 2/4: Checking stream qualities...*\n*{_safe_title[:40]}*", force=True)
         try:
-            rc, tail, timed_out = await _nm_exec(binary, _nm_probe_args(clean_url, probe_dir, headers), job_dir,
+            rc, tail, timed_out = await _nm_exec(binary, _nm_probe_args(clean_url, probe_dir, headers, ffbin), job_dir,
                                                  cancel_flag, timeout=180)
         except (OSError, NotImplementedError) as e:
             code = getattr(e, "winerror", None) or getattr(e, "errno", None)
