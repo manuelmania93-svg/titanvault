@@ -86,6 +86,8 @@ JD_MYJD_EMAIL      = os.getenv("JD_MYJD_EMAIL", "")
 JD_MYJD_PASSWORD   = os.getenv("JD_MYJD_PASSWORD", "")
 JD_MYJD_DEVICE     = os.getenv("JD_MYJD_DEVICE", "")
 JD_TIMEOUT_SEC     = int(os.getenv("JD_TIMEOUT_SEC", "3600"))
+# How long to wait for JDownloader to resolve/check the link before giving up (the download itself keeps JD_TIMEOUT_SEC).
+JD_RESOLVE_TIMEOUT_SEC = int(os.getenv("JD_RESOLVE_TIMEOUT_SEC", "90"))
 # ── Browser handoff bridge (127.0.0.1 only) ──
 BRIDGE_ENABLE      = os.getenv("BRIDGE_ENABLE", "1") != "0"
 BRIDGE_PORT        = int(os.getenv("BRIDGE_PORT", "8765"))
@@ -2819,15 +2821,16 @@ def _jd_blocking_download(url: str, job_dir: str, pkg_name: str, cancel_flag: li
         "destinationFolder": job_dir, "overwritePackagizerRules": True,
     }])
     deadline = time.time() + JD_TIMEOUT_SEC
+    resolve_deadline = min(deadline, time.time() + JD_RESOLVE_TIMEOUT_SEC)
     link_ids, pkg_ids = [], []
     moved = False
     dl_link_ids, dl_pkg_ids = [], []
     try:
         # 1) wait for the link grabber to resolve our package
-        while time.time() < deadline:
+        while time.time() < resolve_deadline:
             if cancel_flag[0]: raise _JDError("__CANCELLED__")
             pkgs = [p for p in jd.call("/linkgrabberv2/queryPackages", [{"saveTo": True, "name": True, "maxResults": -1}])
-                    if os.path.normpath(p.get("saveTo", "")) == os.path.normpath(job_dir)]
+                    if os.path.normcase(os.path.normpath(p.get("saveTo", ""))) == os.path.normcase(os.path.normpath(job_dir))]
             if pkgs:
                 pkg_ids = [p["uuid"] for p in pkgs]
                 links = jd.call("/linkgrabberv2/queryLinks", [{"availability": True, "name": True, "packageUUIDs": pkg_ids, "maxResults": -1}])
@@ -2848,7 +2851,7 @@ def _jd_blocking_download(url: str, job_dir: str, pkg_name: str, cancel_flag: li
         while time.time() < deadline:
             if cancel_flag[0]: raise _JDError("__CANCELLED__")
             dpk = [p for p in jd.call("/downloadsV2/queryPackages", [{"saveTo": True, "maxResults": -1}])
-                   if os.path.normpath(p.get("saveTo", "")) == os.path.normpath(job_dir)]
+                   if os.path.normcase(os.path.normpath(p.get("saveTo", ""))) == os.path.normcase(os.path.normpath(job_dir))]
             if dpk:
                 dl_pkg_ids = [p["uuid"] for p in dpk]
                 dl = jd.call("/downloadsV2/queryLinks", [{"bytesLoaded": True, "bytesTotal": True, "finished": True, "status": True, "packageUUIDs": dl_pkg_ids, "maxResults": -1}])
