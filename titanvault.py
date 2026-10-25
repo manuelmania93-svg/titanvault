@@ -2284,6 +2284,14 @@ def _probe_content_duration(path: str) -> float:
             pass
     return 0.0
 
+# yt-dlp's Python API defaults to NO retries and to silently SKIPPING a fragment that failed (the output is then a
+# shorter file with exit status 0 - measured on a localhost fixture). Retry with growing waits (1,2,4,8,8s), and abort
+# when a fragment still fails so the next engine runs instead of delivering an incomplete file.
+_YDL_RELIABLE = {
+    "retries": 3, "fragment_retries": 5, "skip_unavailable_fragments": False,
+    "retry_sleep_functions": {"http": lambda n: min(2 ** n, 8), "fragment": lambda n: min(2 ** n, 8)},
+}
+
 def _ff_input_duration(ff_err: str) -> float:
     """Input duration FFmpeg prints when it opens the playlist ('Duration: HH:MM:SS.xx'), 0 when absent or N/A (live)."""
     m = re.search(r"Input #0.*?Duration:\s*(\d+):(\d{2}):(\d{2}(?:\.\d+)?)", ff_err or "", re.S)
@@ -2345,10 +2353,8 @@ async def _do_dl_via_ffmpeg_hls(url: str, status_msg, cancel_flag: list, uid: in
             "concurrent_fragment_downloads": 4,
             "progress_hooks": [hook],
             "http_headers": headers_dict,
-            # failed fragments: fewer tries with growing waits (1,2,4,8,8s) instead of 10 immediate repeats
-            "fragment_retries": 5,
-            "retry_sleep_functions": {"fragment": lambda n: min(2 ** n, 8)},
         }
+        ydl_opts.update(_YDL_RELIABLE)
         if COOKIES_FILE: ydl_opts["cookiefile"] = COOKIES_FILE
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([clean_url])
@@ -2913,43 +2919,6 @@ def _jd_classify(exc) -> str:
         return "configured JD address is not a valid URL"
     return "other connection problem (" + type(exc).__name__ + ")"
 
-def _jd_selftest() -> str:
-    """Harmless self-check of the local JDownloader API connection. No links, no downloads."""
-    if JD_MODE != "local":
-        return "JD_MODE is '" + (JD_MODE or "(empty)") + "': the local-API test applies to JD_MODE=local only."
-    base = JD_LOCAL_URL.rstrip("/")
-    lines = [f"Configured address: {base}"]
-    from urllib.parse import urlsplit
-    try:
-        sp = urlsplit(base); host, port = sp.hostname, sp.port or 80
-    except Exception:
-        return "\n".join(lines + ["Configured address is not a valid URL."])
-    # 1) raw TCP, on the configured host and on the other loopback flavour
-    alts = [host] + [h for h in ("127.0.0.1", "::1") if h != host]
-    for h in alts:
-        try:
-            with socket.create_connection((h, port), timeout=3): pass
-            lines.append(f"TCP {h}:{port}: accepted")
-        except Exception as e:
-            lines.append(f"TCP {h}:{port}: " + _jd_classify(e))
-    # 2) HTTP: any reply at all, then the API call the bot uses
-    try:
-        r = requests.get(base + "/", timeout=5)
-        lines.append(f"HTTP GET /: status {r.status_code}")
-    except Exception as e:
-        lines.append("HTTP GET /: " + _jd_classify(e))
-    try:
-        r = requests.post(base + "/downloadcontroller/getCurrentState", json={"params": []}, timeout=8)
-        try: d = r.json()
-        except Exception: d = None
-        if isinstance(d, dict) and "data" in d and d.get("type") is None:
-            lines.append(f"API call: OK (status {r.status_code}, controller state {str(d['data'])[:20]})")
-        else:
-            lines.append(f"API call: status {r.status_code}, reply " + ("JSON but not the expected shape" if d is not None else "not JSON"))
-    except Exception as e:
-        lines.append("API call: " + _jd_classify(e))
-    return "\n".join(lines)
-
 def _jd_blocking_download(url: str, job_dir: str, pkg_name: str, cancel_flag: list, progress_cb) -> str:
     """Runs in a worker thread. Returns the downloaded file path or raises _JDError."""
     jd = _JDClient()
@@ -3049,7 +3018,7 @@ async def _do_dl_via_jdownloader(url: str, status_msg, cancel_flag: list, uid: i
         logging.warning(f"JDownloader unexpected error: {type(e).__name__}")
         _jwhy = _jd_classify(e)
         _diag(uid, "JDownloader", "launch", _jwhy)
-        await safe_final(status_msg, f"❌ JDownloader request failed: {_jwhy}. Send /jdtest for a harmless connection check." + _diag_summary(uid))
+        await safe_final(status_msg, f"❌ JDownloader request failed: {_jwhy}.." + _diag_summary(uid))
         return True
     finally:
         # job-specific cleanup: only the folder this job created
@@ -3200,6 +3169,7 @@ async def _do_dl(url: str, reply_msg, chat_id: int):
                 "merge_output_format": "mp4",
                 "nocheckcertificate": True,
                 "geo_bypass": True,
+                **_YDL_RELIABLE,
                 "http_headers": {
                     "User-Agent": _STANDARD_UA,
                     "Accept-Language": _STANDARD_LANG,
@@ -3863,11 +3833,6 @@ async def _convert_reply(reply_msg, spec: dict, u: Update):
 
 # ── DRM COMMANDS ──────────────────────────────────────
 
-async def jdtest_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
-    if not is_owner(u.effective_user.id): return
-    txt = await asyncio.to_thread(_jd_selftest)
-    await u.message.reply_text("JDownloader connection check\n\n" + txt)
-
 async def status_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     with get_db() as conn:
         cur = conn.cursor()
@@ -4473,7 +4438,6 @@ async def main():
     app.add_handler(CommandHandler(["ep", "resetep"], resetep_cmd))
     app.add_handler(CommandHandler("help",      help_cmd))
     app.add_handler(CommandHandler("status",    status_cmd))
-    app.add_handler(CommandHandler("jdtest",    jdtest_cmd))
     app.add_handler(CommandHandler("limits",    limits_cmd))
     app.add_handler(CommandHandler("files",     files_cmd))
     app.add_handler(CommandHandler("search",    search_cmd))

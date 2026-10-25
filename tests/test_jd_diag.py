@@ -44,7 +44,7 @@ async def main():
     ok("JDownloader: download - timeout" in block(m), "timeout state recorded")
     seed(); r, m = await run(RuntimeError("boom http://h/SECRETJD"))
     b = block(m)
-    ok(r is True and "JDownloader request failed" in m.last and "/jdtest" in m.last and "JDownloader: launch - other connection problem (RuntimeError)" in b and "N_m3u8DL-RE: probe failed" in b and "SECRETJD" not in b, "unexpected error: block appended, fixed state, no error text")
+    ok(r is True and "JDownloader request failed" in m.last and "JDownloader: launch - other connection problem (RuntimeError)" in b and "N_m3u8DL-RE: probe failed" in b and "SECRETJD" not in b, "unexpected error: block appended, fixed state, no error text")
     seed(); r, m = await run(tv._JDError("__CANCELLED__"))
     ok(r is True and "Cancelled" in m.last and "Diagnostics" not in m.last, "cancel: still plain 'Cancelled.', no block")
     seed(); f = os.path.join(tv.ARIA2C_DOWNLOAD_DIR, "okfile.mp4"); open(f, "w").write("x")
