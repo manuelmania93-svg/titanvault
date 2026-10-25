@@ -23,7 +23,7 @@ set JD_MODE=local
 echo Starting TitanVault with JDownloader fallback enabled...
 echo Close this window to stop the bot.
 echo.
-python titanvault.py
+python titan_vault.py
 
 echo.
 echo TitanVault stopped. If it exited unexpectedly, copy the text above.
