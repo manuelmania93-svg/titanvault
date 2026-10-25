@@ -87,14 +87,11 @@ threading.Thread(target=srv.serve_forever, daemon=True).start()
 BASE = f"http://127.0.0.1:{srv.server_address[1]}"
 
 # ---------- units ----------
-M = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=500000,RESOLUTION=640x360\na.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=3000000,RESOLUTION=1920x1080\nb.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=9000000,RESOLUTION=3840x2160\nc.m3u8\n#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=9,RESOLUTION=9999x9999,URI=\"i.m3u8\"\n"
-vs = tv._hls_master_variants(M)
-ok(vs == [(640,360,500000),(1920,1080,3000000),(3840,2160,9000000)], "variants parsed, I-frame lists ignored")
-ok(tv._pick_policy_variant(vs) == (1920,1080), "policy: highest <=1080 wins over 2160")
+ok(tv._pick_policy_variant([(640,360,5),(1920,1080,3),(3840,2160,9)]) == (1920,1080), "policy: highest <=1080 wins over 2160")
 ok(tv._pick_policy_variant([(2560,1440,3),(3840,2160,9)]) == (2560,1440), "policy: only higher -> closest higher")
 ok(tv._pick_policy_variant([(1280,720,1),(1920,1080,1)]) == (1920,1080), "policy: 1080 is allowed")
 ok(tv._pick_policy_variant([(1920,1080,1),(1920,1080,5)]) == (1920,1080), "policy: equal height ok")
-ok(tv._pick_policy_variant([]) is None and tv._hls_master_variants("#EXTM3U\n#EXTINF:2,\nx.ts\n") == [], "media playlist/no master -> no pin")
+ok(tv._pick_policy_variant([]) is None, "no variants -> no pin")
 a = tv._nm_build_args("http://h/x.m3u8", "/tmp/j", {"Referer": "http://r/\r\nEvil: 1", "Cookie": ""}, (1280,720), "")
 ok("-sv" in a and 'res="^1280x720$":for=best' in a and "-sa" in a and "-ds" in a, "args always carry video/audio/subtitle selectors")
 ok(not any("\n" in x or "\r" in x for x in a) and "Referer: http://r/Evil: 1" in a and "Cookie: " not in " ".join(a), "args: CR/LF stripped, empty header dropped")
@@ -103,13 +100,18 @@ ok(tv._nm_classify("Selected streams: ... status code does not indicate success:
 leak = tv._nm_classify("Loading URL: http://x/secret-token-abc.m3u8 refused", False)
 ok("secret" not in " ".join(leak), "classify never echoes URLs")
 ok(tv._nm_find_binary() == NM_BIN, "binary lookup honours N_M3U8DL_PATH")
-ok(tv._nm_policy(M)[0] == "pin", "policy: master with sizes -> pin")
-ok(tv._nm_policy(M.replace(",RESOLUTION=640x360", ""))[0] == "unknown", "policy: any variant without RESOLUTION -> unknown (skip)")
-ok(tv._nm_policy("#EXTM3U\n#EXTINF:2,\nx.ts\n") == ("single", None), "policy: plain media playlist -> single stream, no choice")
-ok(tv._nm_policy("<html>nope</html>")[0] == "unknown" and tv._nm_policy("")[0] == "unknown", "policy: unrecognised manifest -> unknown")
-ok(tv._nm_policy('<MPD><Period><AdaptationSet mimeType="video/mp4"><Representation id="a" bandwidth="5"/></AdaptationSet></Period></MPD>')[0] == "unknown", "policy: DASH without width/height -> unknown")
-_mpd = '<MPD><Period><AdaptationSet contentType="video" mimeType="video/mp4"><Representation id="0" bandwidth="1" width="1280" height="720"/><Representation id="1" bandwidth="2" width="2560" height="1440"/></AdaptationSet><AdaptationSet mimeType="audio/mp4"><Representation id="2" bandwidth="9" width="9999" height="9999"/></AdaptationSet></Period></MPD>'
-ok(tv._nm_policy(_mpd) == ("pin", (1280, 720)), "policy: DASH picks 720 (<=1080), audio set ignored")
+import json as _json
+def _meta(entries):
+    f = os.path.join(FX, "meta_t.json"); open(f, "w", encoding="utf-8-sig").write(_json.dumps(entries)); return f
+V = lambda r, b=1: {"Resolution": r, "Bandwidth": b, "Url": "http://h/SECRETMETA.m3u8"}
+ok(tv._nm_policy_from_meta(_meta([V("640x360"), V("1920x1080"), V("3840x2160"), {"MediaType": "AUDIO", "Bandwidth": 1}])) == ("pin", (1920, 1080)), "meta: BOM file read, audio entry ignored, <=1080 pinned")
+ok(tv._nm_policy_from_meta(_meta([V("2560x1440"), V("3840x2160")])) == ("pin", (2560, 1440)), "meta: only higher -> closest higher")
+ok(tv._nm_policy_from_meta(_meta([V("1280x720", 5), V("1280x720", 9)])) == ("pin", (1280, 720)), "meta: same-size variants -> that size")
+ok(tv._nm_policy_from_meta(_meta([{"Bandwidth": 5}])) == ("single", None), "meta: one stream without Resolution -> single")
+ok(tv._nm_policy_from_meta(_meta([{"Bandwidth": 5}, V("1280x720")]))[0] == "unknown", "meta: a variant without Resolution among several -> unknown")
+ok(tv._nm_policy_from_meta(_meta([{"MediaType": "AUDIO"}]))[0] == "unknown", "meta: no video entries -> unknown")
+ok(tv._nm_policy_from_meta("/nonexistent")[0] == "error" and tv._nm_policy_from_meta(_meta({"a": 1}))[0] == "error", "meta: missing/garbled file -> error")
+
 
 # discovery: a win-x64 folder in Downloads is found, the win-arm64 one never is
 _fh = tempfile.mkdtemp(prefix="nmhome_")
@@ -156,13 +158,13 @@ async def main():
     ok("started - exe launched" in (await run(f"{BASE}/segdeny/master.m3u8", title="x1"), tv._diag_summary(7))[1], "failure after launch shows 'started' then the stage")
     r, up = await run(f"{BASE}/deny/master.m3u8?token=SECRETZ", title="x2")
     d = tv._diag_summary(7)
-    ok("skipped before launch - manifest HTTP 403 (bot pre-fetch)" in d and "started" not in d and "SECRETZ" not in d, "pre-fetch 403: 'skipped before launch', exe never started, no token")
+    ok("probe failed - playlist fetch - HTTP 403 (exe request)" in d and "started" not in d and "probe ok" not in d and "SECRETZ" not in d and "127.0.0.1" not in d, "probe 403 (exe request): reported as probe failure, download never started, no token")
     # exit code: fake exe that exits 3 silently
-    fake = os.path.join(FX, "fakeexe"); open(fake, "w").write("#!/bin/sh\necho 'Response status code does not indicate success: 500'\nexit 3\n"); os.chmod(fake, 0o755)
+    fake = os.path.join(FX, "fakeexe"); open(fake, "w").write("#!/bin/sh\nfor a in \"$@\"; do [ \"$a\" = \"--skip-download\" ] && exec %s \"$@\"; done\necho 'Response status code does not indicate success: 500'\nexit 3\n" % NM_BIN); os.chmod(fake, 0o755)
     tv._NM_BIN_CACHE[:] = [fake, True]
     r, up = await run(f"{BASE}/mux/master.m3u8", title="x3")
     d = tv._diag_summary(7)
-    ok(not r and "started" in d and "exit code 3" in d and "HTTP 500" in d, "non-zero exit reported with exit code and HTTP status")
+    ok(not r and "probe ok" in d and "started" in d and "exit code 3" in d and "HTTP 500" in d, "probe ok, then download exe exits non-zero: exit code and HTTP status reported")
     # launch failure: file that cannot be executed
     bad = os.path.join(FX, "notexe"); open(bad, "w").write("x"); os.chmod(bad, 0o644)
     tv._NM_BIN_CACHE[:] = [bad, True]
@@ -205,7 +207,7 @@ async def main():
     ok(not r and "N_m3u8DL-RE" in d and "HTTP 403" in d and "SECRETX" not in d and "127.0.0.1" not in d, "playlist 403: diagnostic stage/status only, no URL/token")
     r, up = await run(f"{BASE}/segdeny/master.m3u8?token=SECRETY", title="t6")
     d = tv._diag_summary(7)
-    ok(not r and "segment fetch" in d and "HTTP 403" in d and "SECRETY" not in d, "segment 403 classified as segment fetch")
+    ok(not r and "probe ok" in d and "started - exe launched" in d and "segment fetch - HTTP 403" in d and "probe failed" not in d and "SECRETY" not in d, "probe passes, segment 403 in the download run: distinguishable from a probe 403")
     ok(not [x for x in os.listdir(tv.ARIA2C_DOWNLOAD_DIR) if x.startswith("nm_")], "failed runs leave no job dirs")
     # cancel mid-download: process killed, dir cleaned, cancel propagates
     UPLOADED.clear(); tv._diag_reset(7)

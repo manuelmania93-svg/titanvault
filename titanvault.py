@@ -2286,55 +2286,6 @@ def _nm_find_binary() -> str:
     _NM_BIN_CACHE[0], _NM_BIN_CACHE[1] = path, True
     return path
 
-def _hls_master_variants(text: str) -> list:
-    """(width, height, bandwidth_bps) for each #EXT-X-STREAM-INF with a RESOLUTION. [] if not a master."""
-    out = []
-    for line in (text or "").splitlines():
-        if not line.startswith("#EXT-X-STREAM-INF"): continue
-        m = re.search(r"RESOLUTION=(\d+)x(\d+)", line)
-        if not m: continue
-        b = re.search(r"(?<![A-Z-])BANDWIDTH=(\d+)", line)
-        out.append((int(m.group(1)), int(m.group(2)), int(b.group(1)) if b else 0))
-    return out
-
-def _dash_variants(text: str) -> list:
-    """(width, height, bandwidth) for video Representations of an MPD (attributes on the
-    Representation, or inherited from its AdaptationSet). [] when absent."""
-    out = []
-    for aset in re.findall(r"<AdaptationSet\b.*?</AdaptationSet>", text or "", re.S):
-        head = re.match(r"<AdaptationSet\b[^>]*>", aset).group(0)
-        def at(tag, name):
-            m = re.search(r'\b%s="([^"]*)"' % name, tag)
-            return m.group(1) if m else ""
-        for rep in re.findall(r"<Representation\b[^>]*>", aset):
-            mime = at(rep, "mimeType") or at(head, "mimeType") or at(head, "contentType")
-            codecs = at(rep, "codecs") or at(head, "codecs")
-            if mime and "video" not in mime and not (codecs[:4] in ("avc1", "hvc1", "hev1", "av01", "vp09")): continue
-            w = at(rep, "width") or at(head, "width"); h = at(rep, "height") or at(head, "height")
-            bw = at(rep, "bandwidth")
-            if w.isdigit() and h.isdigit():
-                out.append((int(w), int(h), int(bw) if bw.isdigit() else 0))
-    return out
-
-def _nm_policy(text: str):
-    """Decide how to select a video track from the manifest text. Returns ("pin", (w, h)),
-    ("single", None) when there is no choice to make (one media playlist), or ("unknown", None)
-    when the 1080p policy cannot be applied from verified metadata (the leg is then skipped)."""
-    t = text or ""
-    if "#EXT-X-STREAM-INF" in t:
-        n_inf = len(re.findall(r"^#EXT-X-STREAM-INF", t, re.M))
-        vs = _hls_master_variants(t)
-        if vs and len(vs) == n_inf: return "pin", _pick_policy_variant(vs)
-        return "unknown", None
-    if "#EXTINF" in t: return "single", None
-    if "<MPD" in t:
-        vs = _dash_variants(t)
-        n_rep = len(re.findall(r"<Representation\b", t))
-        if vs and n_rep >= len(vs):
-            if len(set((w, h) for w, h, _ in vs)) == 1 and len(vs) == 1: return "single", None
-            return "pin", _pick_policy_variant(vs)
-    return "unknown", None
-
 def _pick_policy_variant(variants: list):
     """Download policy: highest height <=1080; only when nothing is <=1080, the CLOSEST higher
     height. Returns (width, height) or None. Same policy as YDL_FORMAT."""
@@ -2395,10 +2346,79 @@ def _probe_stream_kinds(path: str) -> list:
     except Exception:
         return []
 
+def _nm_probe_args(url: str, probe_dir: str, headers: dict) -> list:
+    """Probe run: the exe fetches and parses the manifest itself, writes meta.json, downloads nothing."""
+    args = [url, "--save-dir", probe_dir, "--save-name", "probe", "--tmp-dir", os.path.join(probe_dir, "tmp"),
+            "--http-request-timeout", "30", "--no-log", "--no-ansi-color", "--skip-download", "--write-meta-json"]
+    for k, v in headers.items():
+        v = re.sub(r"[\r\n]", "", str(v)).strip()
+        if v: args += ["-H", f"{k}: {v}"]
+    args += ["-sv", "best", "-sa", "best", "-ds", "for=all"]   # selectors keep the tool headless
+    return args
+
+def _nm_policy_from_meta(meta_path: str):
+    """("pin", (w, h)) | ("single", None) | ("unknown", None) | ("error", None) from the exe's own meta.json.
+    Only the Resolution of video entries is used; URLs inside the file are never read or logged."""
+    try:
+        with open(meta_path, encoding="utf-8-sig") as fh:
+            data = json.load(fh)
+    except Exception:
+        return "error", None
+    if not isinstance(data, list): return "error", None
+    vids = [e for e in data if isinstance(e, dict) and str(e.get("MediaType") or "VIDEO").upper() == "VIDEO"]
+    if not vids: return "unknown", None
+    sizes = []
+    for e in vids:
+        m = re.match(r"^\s*(\d+)x(\d+)\s*$", str(e.get("Resolution") or ""))
+        if not m:
+            return ("single", None) if len(vids) == 1 else ("unknown", None)
+        sizes.append((int(m.group(1)), int(m.group(2)), int(e.get("Bandwidth") or 0)))
+    return "pin", _pick_policy_variant(sizes)
+
+async def _nm_exec(binary: str, args: list, cwd: str, cancel_flag: list, on_chunk=None, timeout: int = 7200):
+    """Run the exe. Returns (returncode, output_tail, timed_out). Raises OSError/NotImplementedError when it
+    cannot be launched and Exception("__CANCELLED__") on cancel (process tree killed either way)."""
+    proc = await asyncio.create_subprocess_exec(
+        binary, *args, stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, cwd=cwd)
+    tail = [""]
+    async def _reader():
+        while True:
+            chunk = await proc.stdout.read(4096)
+            if not chunk: break
+            t = chunk.decode("utf-8", errors="replace")
+            tail[0] = (tail[0] + t)[-6000:]
+            if on_chunk: await on_chunk(t)
+    rtask = asyncio.ensure_future(_reader())
+    try:
+        t0 = time.time()
+        while proc.returncode is None:
+            try:
+                await asyncio.wait_for(asyncio.shield(proc.wait()), 1.0)
+            except asyncio.TimeoutError:
+                pass
+            if cancel_flag[0]:
+                raise Exception("__CANCELLED__")
+            if time.time() - t0 > timeout:
+                _kill_proc_tree(proc)
+                return proc.returncode if proc.returncode is not None else -1, tail[0], True
+        try: await asyncio.wait_for(rtask, 10)
+        except Exception: rtask.cancel()
+        return proc.returncode, tail[0], False
+    finally:
+        if proc.returncode is None:
+            _kill_proc_tree(proc)
+            try: await asyncio.wait_for(proc.wait(), 5)
+            except Exception: pass
+        if not rtask.done(): rtask.cancel()
+
 async def _do_dl_via_nm3u8dl(url: str, status_msg, cancel_flag: list, uid: int, chat_id: int, page_url: str = "",
                              title: str = "", referer: str = "", extra_headers: dict = None) -> bool:
-    """HLS/DASH via the external N_m3u8DL-RE binary. Output is validated with ffprobe and handed to
-    _finish_upload like every other leg. Returns False (with a diagnostic) on any failure."""
+    """HLS/DASH via the external N_m3u8DL-RE binary, in two runs of the exe itself:
+    1) probe (--skip-download --write-meta-json): the exe fetches the manifest with our headers, we read the
+       variant sizes from its meta.json and apply the 1080p policy; no request is made by the bot itself.
+    2) download with the chosen variant pinned. Output is validated with ffprobe and handed to _finish_upload.
+    Returns False (with a fixed-vocabulary diagnostic) on any failure."""
     leg = "HLS via N_m3u8DL-RE"
     if N_M3U8DL_MODE == "off":
         _diag(uid, leg, "disabled", "N_M3U8DL_MODE=off")
@@ -2415,87 +2435,70 @@ async def _do_dl_via_nm3u8dl(url: str, status_msg, cancel_flag: list, uid: int, 
     headers.update({_canon[str(k).lower()]: str(v)[:500] for k, v in (extra_headers or {}).items()
                     if str(k).lower() in _canon})
     _safe_title = re.sub(r'[\\/*?:"<>|]', "", title).strip() or f"video_{uid}"
-    loop = asyncio.get_running_loop()
-
-    # Resolution policy: read the manifest ourselves (same headers) and pin the chosen variant.
-    # When the policy cannot be applied from verified metadata the leg is skipped, never "best".
-    target = None
-    try:
-        def _fetch():
-            r = requests.get(clean_url, headers=headers, timeout=20)
-            r.raise_for_status()
-            return r.text
-        txt = await loop.run_in_executor(None, _fetch)
-        kind, target = _nm_policy(txt)
-    except Exception as e:
-        code = getattr(getattr(e, "response", None), "status_code", None)
-        _diag(uid, leg, "skipped before launch", f"manifest HTTP {code} (bot pre-fetch)" if code else f"manifest {_diag_detail(e)} (bot pre-fetch)")
-        return False
-    if kind == "unknown":
-        _diag(uid, leg, "skipped before launch", "variant sizes unknown")
-        return False
     job_dir = os.path.join(ARIA2C_DOWNLOAD_DIR, f"nm_{uid}_{int(time.time())}")
-    os.makedirs(job_dir, exist_ok=True)
+    probe_dir = os.path.join(job_dir, "probe")
+    os.makedirs(probe_dir, exist_ok=True)
     ffbin = shutil.which(FFMPEG_PATH) or ""
-    args = _nm_build_args(clean_url, job_dir, headers, target, ffbin)
-    proc = None
-    tail, selected_seen, last_edit, pct_txt = "", False, [0.0], [""]
+    last_edit = [0.0]
     try:
-        await safe_edit(status_msg, f"📥 *Step 2/4: Retrying stream with N_m3u8DL-RE...*\n*{_safe_title[:40]}*", force=True)
+        # ---- 1) probe ----
+        await safe_edit(status_msg, f"🔍 *Step 2/4: Checking stream qualities...*\n*{_safe_title[:40]}*", force=True)
         try:
-            proc = await asyncio.create_subprocess_exec(
-                binary, *args, stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, cwd=job_dir)
+            rc, tail, timed_out = await _nm_exec(binary, _nm_probe_args(clean_url, probe_dir, headers), job_dir,
+                                                 cancel_flag, timeout=180)
         except (OSError, NotImplementedError) as e:
             code = getattr(e, "winerror", None) or getattr(e, "errno", None)
             _diag(uid, leg, "launch failed", f"{type(e).__name__}" + (f" {code}" if code else ""))
             return False
-        _diag(uid, leg, "started", "exe launched")
+        meta_path = os.path.join(probe_dir, "tmp", "probe", "meta.json")
+        if timed_out or rc != 0 or not os.path.isfile(meta_path):
+            if timed_out:
+                _diag(uid, leg, "probe failed", "timeout (exe request)")
+            else:
+                stage, detail = _nm_classify(tail, False)
+                _diag(uid, leg, "probe failed", f"{stage} - {detail} (exe request)" + (f" (exit code {rc})" if rc not in (0, None) else ""))
+            return False
+        kind, target = _nm_policy_from_meta(meta_path)
+        shutil.rmtree(probe_dir, ignore_errors=True)       # meta.json holds full segment URLs/tokens
+        if kind in ("unknown", "error"):
+            _diag(uid, leg, "skipped before launch", "variant sizes unknown" if kind == "unknown" else "probe result unreadable")
+            return False
+        _diag(uid, leg, "probe ok", "single stream" if kind == "single" else "variant pinned")
 
-        async def _reader():
-            nonlocal tail, selected_seen
-            while True:
-                chunk = await proc.stdout.read(4096)
-                if not chunk: break
-                t = chunk.decode("utf-8", errors="replace")
-                tail = (tail + t)[-6000:]
-                if "Selected streams" in tail: selected_seen = True
-                ms = re.findall(r"(\d+)/(\d+)\s+(\d+(?:\.\d+)?)%", t)
-                if ms:
-                    d, n, pc = ms[-1]
-                    pct_txt[0] = (int(d), int(n), float(pc))
-                    now = time.time()
-                    if now - last_edit[0] >= 2.0:
-                        last_edit[0] = now
-                        pct = int(float(pc)); bar = "▓" * int(16 * pct / 100) + "░" * (16 - int(16 * pct / 100))
-                        await safe_edit(status_msg, f"📥 *Step 2/4: Streaming HLS/DASH Chunks...*\n*{_safe_title[:40]}*\n\n[{bar}] {pct}% ({d}/{n} parts)")
-        rtask = asyncio.ensure_future(_reader())
-        t0 = time.time()
-        while proc.returncode is None:
-            try:
-                await asyncio.wait_for(asyncio.shield(proc.wait()), 1.0)
-            except asyncio.TimeoutError:
-                pass
-            if cancel_flag[0]:
-                raise Exception("__CANCELLED__")
-            if time.time() - t0 > N_M3U8DL_TIMEOUT_SEC:
-                _kill_proc_tree(proc)
-                _diag(uid, leg, "download", "timeout")
-                return False
-        try: await asyncio.wait_for(rtask, 10)
-        except Exception: rtask.cancel()
+        # ---- 2) download ----
+        args = _nm_build_args(clean_url, job_dir, headers, target, ffbin)
+        sel = [False]
+        async def _on_chunk(t):
+            if "Selected streams" in t: sel[0] = True
+            ms = re.findall(r"(\d+)/(\d+)\s+(\d+(?:\.\d+)?)%", t)
+            if ms:
+                d, n, pc = ms[-1]
+                now = time.time()
+                if now - last_edit[0] >= 2.0:
+                    last_edit[0] = now
+                    pct = int(float(pc)); bar = "▓" * int(16 * pct / 100) + "░" * (16 - int(16 * pct / 100))
+                    await safe_edit(status_msg, f"📥 *Step 2/4: Streaming HLS/DASH Chunks...*\n*{_safe_title[:40]}*\n\n[{bar}] {pct}% ({d}/{n} parts)")
+        await safe_edit(status_msg, f"📥 *Step 2/4: Retrying stream with N_m3u8DL-RE...*\n*{_safe_title[:40]}*", force=True)
+        _diag(uid, leg, "started", "exe launched")
+        try:
+            rc, tail, timed_out = await _nm_exec(binary, args, job_dir, cancel_flag, on_chunk=_on_chunk, timeout=N_M3U8DL_TIMEOUT_SEC)
+        except (OSError, NotImplementedError) as e:
+            code = getattr(e, "winerror", None) or getattr(e, "errno", None)
+            _diag(uid, leg, "launch failed", f"{type(e).__name__}" + (f" {code}" if code else ""))
+            return False
+        if timed_out:
+            _diag(uid, leg, "download", "timeout")
+            return False
         outs = [os.path.join(job_dir, f) for f in os.listdir(job_dir)
                 if os.path.isfile(os.path.join(job_dir, f)) and os.path.getsize(os.path.join(job_dir, f)) > 0]
-        mp4s = [f for f in outs if f.lower().endswith(".mp4")]
-        good = [f for f in mp4s if "video" in _probe_stream_kinds(f)]
-        if proc.returncode != 0 or not good:
-            stage, detail = _nm_classify(tail, selected_seen)
-            if proc.returncode == 0: stage, detail = "output check", "no video stream in output"
-            elif proc.returncode is not None: detail = f"{detail} (exit code {proc.returncode})"
+        good = [f for f in outs if f.lower().endswith(".mp4") and "video" in _probe_stream_kinds(f)]
+        if rc != 0 or not good:
+            stage, detail = _nm_classify(tail, sel[0] or "Selected streams" in tail)
+            if rc == 0: stage, detail = "output check", "no video stream in output"
+            elif rc is not None: detail = f"{detail} (exit code {rc})"
             _diag(uid, leg, stage, detail)
             return False
-        out = max(good, key=os.path.getsize)
-        return await _finish_upload(out, _safe_title, status_msg, uid, chat_id)
+        return await _finish_upload(max(good, key=os.path.getsize), _safe_title, status_msg, uid, chat_id)
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -2503,18 +2506,12 @@ async def _do_dl_via_nm3u8dl(url: str, status_msg, cancel_flag: list, uid: int, 
         _diag(uid, leg, "download", _diag_detail(e))
         return False
     finally:
-        if proc is not None and proc.returncode is None:
-            _kill_proc_tree(proc)
-            try: await asyncio.wait_for(proc.wait(), 5)
-            except Exception: pass
-        # _finish_upload keeps a failed-upload source under _KEPT_SOURCES; move nothing here: the job dir
-        # is removed unless it holds a kept source.
+        shutil.rmtree(probe_dir, ignore_errors=True)
         try:
             if not any(k.startswith(job_dir) for k in _KEPT_SOURCES):
                 shutil.rmtree(job_dir, ignore_errors=True)
         except Exception:
             pass
-
 
 async def _finish_upload(file_path: str, title: str, status_msg, uid: int, chat_id: int, skip_convert: bool = False) -> bool:
     loop  = asyncio.get_running_loop()
