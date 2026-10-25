@@ -2802,11 +2802,15 @@ async def _do_dl_via_jdownloader(url: str, status_msg, cancel_flag: list, uid: i
             await safe_edit(status_msg, "⛔ Cancelled.", force=True)
         else:
             logging.warning(f"JDownloader: {e}")
-            await safe_edit(status_msg, f"❌ JDownloader could not get this link ({str(e)[:100]}).", force=True)
+            _low = str(e).lower()
+            _diag(uid, "JDownloader", "download", "link offline or unsupported" if "offline" in _low or "unsupported" in _low
+                  else "timeout" if "timed out" in _low or "timeout" in _low else "download error")
+            await safe_edit(status_msg, f"❌ JDownloader could not get this link ({str(e)[:100]})." + _diag_summary(uid), force=True)
         return True
     except Exception as e:
         logging.warning(f"JDownloader unexpected error: {type(e).__name__}")
-        await safe_edit(status_msg, "❌ JDownloader failed (is it running with the API enabled?).", force=True)
+        _diag(uid, "JDownloader", "launch", "not reachable or API disabled")
+        await safe_edit(status_msg, "❌ JDownloader failed (is it running with the API enabled?)." + _diag_summary(uid), force=True)
         return True
     finally:
         # job-specific cleanup: only the folder this job created
