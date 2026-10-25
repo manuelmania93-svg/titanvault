@@ -2261,6 +2261,42 @@ async def _do_dl_via_cffi(url: str, status_msg, cancel_flag: list, uid: int, cha
 
     return await _finish_upload(result_file, title, status_msg, uid, chat_id)
 
+def _probe_content_duration(path: str) -> float:
+    """Playing time actually present in the first video (else audio) stream: sum of the gaps between packet
+    timestamps, where a gap far above the typical frame spacing (a skipped segment) counts as that spacing only.
+    The container duration cannot be used: it keeps the original end time even when a middle segment is missing."""
+    for sel in ("v:0", "a:0"):
+        try:
+            r = subprocess.run([FFPROBE_PATH, "-v", "error", "-select_streams", sel, "-show_entries", "packet=pts_time",
+                                "-of", "csv=p=0", path], capture_output=True, text=True, timeout=180)
+            ts = []
+            for ln in (r.stdout or "").splitlines():
+                try: ts.append(float(ln.strip().rstrip(",")))
+                except ValueError: pass
+            ts.sort()
+            if len(ts) < 3: continue
+            deltas = sorted(b - a for a, b in zip(ts, ts[1:]))
+            med = deltas[len(deltas) // 2] or 0.04
+            cap = max(med * 5, 0.5)
+            return sum(min(d, cap) for d in deltas) + med
+        except Exception:
+            pass
+    return 0.0
+
+def _ff_input_duration(ff_err: str) -> float:
+    """Input duration FFmpeg prints when it opens the playlist ('Duration: HH:MM:SS.xx'), 0 when absent or N/A (live)."""
+    m = re.search(r"Input #0.*?Duration:\s*(\d+):(\d{2}):(\d{2}(?:\.\d+)?)", ff_err or "", re.S)
+    return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3)) if m else 0.0
+
+def _ff_looks_truncated(ff_err: str, out_path: str) -> bool:
+    """True when FFmpeg exited OK but the file is much shorter than the playlist it was reading (a segment
+    that failed to download is skipped silently by FFmpeg's HLS reader). Only a candidate check for finite
+    VOD playlists: no input duration (live/unknown) means no verdict, and a generous tolerance is applied."""
+    inp = _ff_input_duration(ff_err)
+    if inp < 5: return False
+    out = _probe_content_duration(out_path)
+    return bool(out) and out < inp * 0.95 and (inp - out) > 1.5
+
 async def _do_dl_via_ffmpeg_hls(url: str, status_msg, cancel_flag: list, uid: int, chat_id: int, page_url: str = "", title: str = "", referer: str = "", extra_headers: dict = None) -> bool:
     _canon = {"user-agent": "User-Agent", "referer": "Referer", "origin": "Origin",
               "accept": "Accept", "accept-language": "Accept-Language"}
@@ -2308,6 +2344,9 @@ async def _do_dl_via_ffmpeg_hls(url: str, status_msg, cancel_flag: list, uid: in
             "concurrent_fragment_downloads": 4,
             "progress_hooks": [hook],
             "http_headers": headers_dict,
+            # failed fragments: fewer tries with growing waits (1,2,4,8,8s) instead of 10 immediate repeats
+            "fragment_retries": 5,
+            "retry_sleep_functions": {"fragment": lambda n: min(2 ** n, 8)},
         }
         if COOKIES_FILE: ydl_opts["cookiefile"] = COOKIES_FILE
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -2345,10 +2384,17 @@ async def _do_dl_via_ffmpeg_hls(url: str, status_msg, cancel_flag: list, uid: in
     try:
         proc = await asyncio.create_subprocess_exec(*ff_cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
         _, ff_err = await proc.communicate()
+        ff_text = (ff_err or b"").decode(errors="replace")
         if os.path.exists(ydl_out) and _probe_has_media_stream(ydl_out):
-            return await _finish_upload(ydl_out, _safe_title, status_msg, uid, chat_id)
-        err_tail = (ff_err or b"").decode(errors="replace")[-2000:]
-        _diag(uid, "HLS via ffmpeg", _classify_hls_stage(err_tail), _diag_detail(err_tail))
+            if await asyncio.to_thread(_ff_looks_truncated, ff_text, ydl_out):
+                _diag(uid, "HLS via ffmpeg", "output check", "incomplete - output much shorter than the playlist")
+                try: os.remove(ydl_out)
+                except Exception: pass
+            else:
+                return await _finish_upload(ydl_out, _safe_title, status_msg, uid, chat_id)
+        err_tail = ff_text[-2000:]
+        if not any(e[0] == "HLS via ffmpeg" and e[1] == "output check" and e[2].startswith("incomplete") for e in (dl_diag.get(uid) or [])):
+            _diag(uid, "HLS via ffmpeg", _classify_hls_stage(err_tail), _diag_detail(err_tail))
         if _TITANVAULT_DEBUG and err_tail:
             logging.info(f"[diag] ffmpeg stderr tail: {err_tail[-400:]}")
     except Exception as e:
@@ -2489,19 +2535,26 @@ def _nm_policy_from_meta(meta_path: str):
         sizes.append((int(m.group(1)), int(m.group(2)), int(e.get("Bandwidth") or 0)))
     return "pin", _pick_policy_variant(sizes)
 
-async def _nm_exec(binary: str, args: list, cwd: str, cancel_flag: list, on_chunk=None, timeout: int = 7200):
+_NM_REFUSAL_RE = re.compile(r"status code[^:\n]*:\s*(?:401|403)[^\n]*?\(2/\d+\)")
+_NM_STOPPED_EARLY = -999   # returncode we report when we stopped the exe after repeated refusals
+
+async def _nm_exec(binary: str, args: list, cwd: str, cancel_flag: list, on_chunk=None, timeout: int = 7200, stop_re=None):
     """Run the exe. Returns (returncode, output_tail, timed_out). Raises OSError/NotImplementedError when it
     cannot be launched and Exception("__CANCELLED__") on cancel (process tree killed either way)."""
     proc = await asyncio.create_subprocess_exec(
         binary, *args, stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, cwd=cwd)
     tail = [""]
+    stopped = [False]
     async def _reader():
         while True:
             chunk = await proc.stdout.read(4096)
             if not chunk: break
             t = chunk.decode("utf-8", errors="replace")
             tail[0] = (tail[0] + t)[-6000:]
+            if stop_re is not None and not stopped[0] and stop_re.search(tail[0]):
+                stopped[0] = True          # the same request was refused twice: do not let the exe repeat it 10 times
+                _kill_proc_tree(proc)
             if on_chunk: await on_chunk(t)
     rtask = asyncio.ensure_future(_reader())
     try:
@@ -2518,6 +2571,8 @@ async def _nm_exec(binary: str, args: list, cwd: str, cancel_flag: list, on_chun
                 return proc.returncode if proc.returncode is not None else -1, tail[0], True
         try: await asyncio.wait_for(rtask, 10)
         except Exception: rtask.cancel()
+        if stopped[0]:
+            return _NM_STOPPED_EARLY, tail[0], False
         return proc.returncode, tail[0], False
     finally:
         if proc.returncode is None:
@@ -2561,7 +2616,7 @@ async def _do_dl_via_nm3u8dl(url: str, status_msg, cancel_flag: list, uid: int, 
         await safe_edit(status_msg, f"🔍 *Step 2/4: Checking stream qualities...*\n*{_safe_title[:40]}*", force=True)
         try:
             rc, tail, timed_out = await _nm_exec(binary, _nm_probe_args(clean_url, probe_dir, headers, ffbin), job_dir,
-                                                 cancel_flag, timeout=180)
+                                                 cancel_flag, timeout=180, stop_re=_NM_REFUSAL_RE)
         except (OSError, NotImplementedError) as e:
             code = getattr(e, "winerror", None) or getattr(e, "errno", None)
             _diag(uid, leg, "launch failed", f"{type(e).__name__}" + (f" {code}" if code else ""))
@@ -2572,7 +2627,7 @@ async def _do_dl_via_nm3u8dl(url: str, status_msg, cancel_flag: list, uid: int, 
                 _diag(uid, leg, "probe failed", "timeout (exe request)")
             else:
                 stage, detail = _nm_classify(tail, False)
-                _diag(uid, leg, "probe failed", f"{stage} - {detail} (exe request)" + (f" (exit code {rc})" if rc not in (0, None) else ""))
+                _diag(uid, leg, "probe failed", f"{stage} - {detail} (exe request)" + (" (stopped after the request was refused twice)" if rc == _NM_STOPPED_EARLY else f" (exit code {rc})" if rc not in (0, None) else ""))
             return False
         kind, target = _nm_policy_from_meta(meta_path)
         shutil.rmtree(probe_dir, ignore_errors=True)       # meta.json holds full segment URLs/tokens
