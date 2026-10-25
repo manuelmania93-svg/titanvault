@@ -31,7 +31,7 @@ from colorama import Fore, Style, init
 
 # ── python-telegram-bot ───────────────────────────────
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
-from telegram.error import RetryAfter, TimedOut, NetworkError
+from telegram.error import RetryAfter, TimedOut, NetworkError, BadRequest
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     CallbackQueryHandler, filters, ContextTypes,
@@ -372,11 +372,15 @@ def prepare_telegram_thumb(image_path: str) -> str:
             pass
     return image_path
 
+_FINAL_MAX_WAIT = 30.0
+
 async def safe_edit(msg, text: str, reply_markup=None, parse_mode="Markdown", force: bool = False):
     now = time.time()
     if now < _flood_wait_until[0] and not force:
         return
 
+    if not force and time.time() - _finalized_at.get(_msg_key(msg), 0.0) < 60:
+        return      # a late progress edit must not overwrite a delivered final message
     msg_id = getattr(msg, "message_id", None) or id(msg)
     last_time = _last_edit_times.get(msg_id, 0.0)
 
@@ -388,6 +392,15 @@ async def safe_edit(msg, text: str, reply_markup=None, parse_mode="Markdown", fo
         await msg.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
     except RetryAfter as e:
         _flood_wait_until[0] = time.time() + e.retry_after
+    except BadRequest as e:
+        # BadRequest subclasses NetworkError, so it used to be swallowed by the clause below and the
+        # plain-text retry never ran: a rejected Markdown message was silently dropped.
+        if "not modified" in str(e).lower():
+            return
+        try:
+            await msg.edit_text(text, reply_markup=reply_markup, parse_mode=None)
+        except Exception:
+            pass
     except (NetworkError, TimedOut):
         pass
     except Exception:
@@ -395,6 +408,73 @@ async def safe_edit(msg, text: str, reply_markup=None, parse_mode="Markdown", fo
             await msg.edit_text(text, reply_markup=reply_markup, parse_mode=None)
         except Exception:
             pass
+
+_finalized_at: dict = {}   # (chat_id, message_id) -> time a final message was delivered
+
+
+def _msg_key(msg):
+    return (getattr(msg, "chat_id", None), getattr(msg, "message_id", None) or id(msg))
+
+
+async def safe_final(msg, text: str, reply_markup=None, parse_mode="Markdown") -> bool:
+    """Deliver a FINAL status message (failure/cancel). Never raises, returns True when delivered.
+
+    Unlike safe_edit this does not drop the message on a timeout or flood wait:
+    - Markdown rejected -> same text as plain.
+    - RetryAfter -> wait the requested time (bounded to _FINAL_MAX_WAIT per wait) and retry.
+    - TimedOut/NetworkError -> bounded retries; an edit is idempotent, so a retry after an
+      edit that actually landed answers 'message is not modified', which counts as delivered.
+    - Edit still failing -> one new reply (fallback). If the edit had in fact landed but the
+      network hid it, that can leave a duplicate final message (accepted, rare).
+    Warnings carry only fixed text and exception class names - never exception text/URLs/paths.
+    """
+    def _unmodified(exc):
+        return "not modified" in str(exc).lower()
+
+    async def _attempt(call, label):
+        plain = False
+        for n in range(3):
+            try:
+                await call(None if plain else parse_mode)
+                return True
+            except RetryAfter as e:
+                wait = min(float(getattr(e, "retry_after", 1) or 1) + 1, _FINAL_MAX_WAIT)
+                logging.warning(f"final message {label}: Telegram rate limit, waiting {int(wait)}s (try {n + 1}/3)")
+                if float(getattr(e, "retry_after", 1) or 1) > _FINAL_MAX_WAIT:
+                    return False
+                await asyncio.sleep(wait)
+            except BadRequest as e:      # BadRequest subclasses NetworkError: must be handled first
+                if _unmodified(e):
+                    return True
+                if not plain and parse_mode:
+                    plain = True      # formatting rejected: retry the same text as plain
+                    continue
+                logging.warning(f"final message {label}: rejected by Telegram")
+                return False
+            except (NetworkError, TimedOut) as e:
+                logging.warning(f"final message {label}: network problem {type(e).__name__} (try {n + 1}/3)")
+                await asyncio.sleep(1.0 + n)
+            except Exception as e:
+                if _unmodified(e):
+                    return True
+                if not plain and parse_mode:
+                    plain = True      # formatting rejected: retry the same text as plain
+                    continue
+                logging.warning(f"final message {label}: rejected {type(e).__name__}")
+                return False
+        return False
+
+    ok = await _attempt(lambda pm: msg.edit_text(text, reply_markup=reply_markup, parse_mode=pm), "edit")
+    if not ok:
+        logging.warning("final message: edit failed, sending a new reply instead")
+        ok = await _attempt(lambda pm: msg.reply_text(text, parse_mode=pm), "reply")
+        if not ok:
+            logging.warning("final message: could not be delivered to Telegram")
+    if len(_finalized_at) > 500:
+        _finalized_at.clear()
+    _finalized_at[_msg_key(msg)] = time.time()
+    return ok
+
 
 async def safe_copy(bot, to_chat_id: int, from_chat_id: int, message_id: int, **kwargs):
     for attempt in range(4):
@@ -2528,7 +2608,7 @@ async def _finish_upload(file_path: str, title: str, status_msg, uid: int, chat_
     if ext in media_exts and not _probe_has_media_stream(file_path):
         # Server delivered a non-media payload (error page etc.) under a media name.
         logging.warning(f"[finish_upload] rejected non-media payload: {os.path.basename(file_path)}")
-        await safe_edit(status_msg, "❌ The site did not deliver a playable media file (likely an error page or expired link).", force=True)
+        await safe_final(status_msg, "❌ The site did not deliver a playable media file (likely an error page or expired link).")
         try: os.remove(file_path)
         except Exception: pass
         return False
@@ -2604,7 +2684,7 @@ async def _finish_upload(file_path: str, title: str, status_msg, uid: int, chat_
                 await asyncio.sleep(2)
 
         if not sent:
-            await safe_edit(status_msg, f"❌ Upload failed due to persistent Telegram rate limits.\nYour download was kept: `{os.path.basename(file_path)}`", force=True)
+            await safe_final(status_msg, f"❌ Upload failed due to persistent Telegram rate limits.\nYour download was kept: `{os.path.basename(file_path)}`")
             return False
 
         with get_db() as conn:
@@ -2799,19 +2879,19 @@ async def _do_dl_via_jdownloader(url: str, status_msg, cancel_flag: list, uid: i
         return True
     except _JDError as e:
         if "__CANCELLED__" in str(e):
-            await safe_edit(status_msg, "⛔ Cancelled.", force=True)
+            await safe_final(status_msg, "⛔ Cancelled.")
         else:
             logging.warning(f"JDownloader: {e}")
             _low = str(e).lower()
             _why = ("link offline or unsupported" if "offline" in _low or "unsupported" in _low
                     else "timeout" if "timed out" in _low or "timeout" in _low else "download error")
             _diag(uid, "JDownloader", "download", _why)
-            await safe_edit(status_msg, f"❌ JDownloader could not get this link ({_why})." + _diag_summary(uid), force=True)
+            await safe_final(status_msg, f"❌ JDownloader could not get this link ({_why})." + _diag_summary(uid))
         return True
     except Exception as e:
         logging.warning(f"JDownloader unexpected error: {type(e).__name__}")
         _diag(uid, "JDownloader", "launch", "not reachable or API disabled")
-        await safe_edit(status_msg, "❌ JDownloader failed (is it running with the API enabled?)." + _diag_summary(uid), force=True)
+        await safe_final(status_msg, "❌ JDownloader failed (is it running with the API enabled?)." + _diag_summary(uid))
         return True
     finally:
         # job-specific cleanup: only the folder this job created
@@ -2843,21 +2923,21 @@ async def _run_direct_stream(url: str, status, uid: int, chat_id: int, referer: 
         await safe_edit(status, f"📥 *Direct media URL received*\n`{redact_url(clean_url)}`", reply_markup=kb, force=True)
         ok = await _do_dl_via_aria2c(clean_url, tmp_out, status, cancel_flag, headers=hdrs, uid=uid)
         if cancel_flag[0]:
-            await safe_edit(status, "⛔ Cancelled.", force=True)
+            await safe_final(status, "⛔ Cancelled.")
             return
         if ok:
             await _finish_upload(tmp_out, safe_title, status, uid, chat_id)
             return
         await _do_dl_via_cffi(clean_url, status, cancel_flag, uid, chat_id, headers=hdrs, title=safe_title, page_url=ref)
     except asyncio.CancelledError:
-        await safe_edit(status, "⛔ Cancelled.", force=True)
+        await safe_final(status, "⛔ Cancelled.")
     except Exception as e:
         if "__CANCELLED__" in str(e):
-            await safe_edit(status, "⛔ Cancelled.", force=True)
+            await safe_final(status, "⛔ Cancelled.")
         else:
             logging.error(f"Stream job error: {type(e).__name__}")
             _diag(uid, "stream job", "download", _diag_detail(e))
-            await safe_edit(status, f"❌ Error: {type(e).__name__}" + _diag_summary(uid), force=True)
+            await safe_final(status, f"❌ Error: {type(e).__name__}" + _diag_summary(uid))
     finally:
         dl_tasks.pop(uid, None)
         dl_cancel_flags.pop(uid, None)
@@ -3002,7 +3082,7 @@ async def _do_dl(url: str, reply_msg, chat_id: int):
             if await _do_dl_via_jdownloader(url, status, cancel_flag, uid, chat_id, title=scraped_title):
                 return True
             _diag(uid, "JDownloader", "-", "unavailable or failed")
-            await safe_edit(status, "❌ Could not download the detected stream (host error, expired link, or unsupported site)." + _diag_summary(uid), force=True)
+            await safe_final(status, "❌ Could not download the detected stream (host error, expired link, or unsupported site)." + _diag_summary(uid))
             return False
 
         # 1. Direct HLS / DASH Stream routing
@@ -3042,7 +3122,7 @@ async def _do_dl(url: str, reply_msg, chat_id: int):
             if await _do_dl_via_jdownloader(url, status, cancel_flag, uid, chat_id, title=scraped_title):
                 return
             _diag(uid, "JDownloader", "-", "unavailable or failed")
-            await safe_edit(status, "❌ Could not extract video stream from this URL (unsupported or protected site)." + _diag_summary(uid), force=True)
+            await safe_final(status, "❌ Could not extract video stream from this URL (unsupported or protected site)." + _diag_summary(uid))
             return
 
         # Native yt-dlp core for standard platforms
@@ -3051,17 +3131,17 @@ async def _do_dl(url: str, reply_msg, chat_id: int):
         if await _do_dl_via_jdownloader(url, status, cancel_flag, uid, chat_id, title=scraped_title):
             return
         _diag(uid, "JDownloader", "-", "unavailable or failed")
-        await safe_edit(status, "❌ Could not download video from this URL." + _diag_summary(uid), force=True)
+        await safe_final(status, "❌ Could not download video from this URL." + _diag_summary(uid))
         return
 
     except asyncio.CancelledError:
-        await safe_edit(status, "⛔ Cancelled.", force=True)
+        await safe_final(status, "⛔ Cancelled.")
     except Exception as e:
         if "__CANCELLED__" in str(e):
-            await safe_edit(status, "⛔ Cancelled.", force=True)
+            await safe_final(status, "⛔ Cancelled.")
         else:
             logging.error(f"DL error: {e}", exc_info=True)
-            await safe_edit(status, f"❌ Error: {str(e)[:180]}", force=True)
+            await safe_final(status, f"❌ Error: {str(e)[:180]}")
     finally:
         dl_tasks.pop(uid, None)
         dl_cancel_flags.pop(uid, None)
