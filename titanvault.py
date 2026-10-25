@@ -12,6 +12,7 @@ import logging
 import sqlite3
 import os
 import re
+import socket
 import time
 import math
 import struct
@@ -2885,6 +2886,70 @@ class _JDClient:
             return data["data"]
         raise _JDError(f"JDownloader error: {str(data)[:120]}")
 
+def _jd_classify(exc) -> str:
+    """Fixed-vocabulary reason for a failed JDownloader request. Looks at what the OS/socket layer reported,
+    never prints exception text (it can contain URLs)."""
+    seen, e = set(), exc
+    kinds = []
+    while e is not None and id(e) not in seen:
+        seen.add(id(e)); kinds.append(e)
+        for a in getattr(e, "args", ()):
+            if isinstance(a, BaseException) and id(a) not in seen: kinds.append(a)
+        e = e.__cause__ or e.__context__
+    names = {type(k).__name__ for k in kinds}
+    if any(isinstance(k, ConnectionRefusedError) for k in kinds):
+        return "connection refused (nothing accepted a connection at the configured address and port)"
+    if any(isinstance(k, ConnectionResetError) for k in kinds) or "RemoteDisconnected" in names or "ProtocolError" in names:
+        return "connection was closed by the other side"
+    if "ReadTimeout" in names:
+        return "connected, but no reply in time"
+    if "ConnectTimeout" in names or any(isinstance(k, TimeoutError) for k in kinds):
+        return "connection attempt timed out"
+    if any(isinstance(k, socket.gaierror) for k in kinds) or "NameResolutionError" in names:
+        return "address could not be resolved"
+    if "SSLError" in names:
+        return "TLS error (is the URL http:// ?)"
+    if "InvalidURL" in names or "MissingSchema" in names or "InvalidSchema" in names:
+        return "configured JD address is not a valid URL"
+    return "other connection problem (" + type(exc).__name__ + ")"
+
+def _jd_selftest() -> str:
+    """Harmless self-check of the local JDownloader API connection. No links, no downloads."""
+    if JD_MODE != "local":
+        return "JD_MODE is '" + (JD_MODE or "(empty)") + "': the local-API test applies to JD_MODE=local only."
+    base = JD_LOCAL_URL.rstrip("/")
+    lines = [f"Configured address: {base}"]
+    from urllib.parse import urlsplit
+    try:
+        sp = urlsplit(base); host, port = sp.hostname, sp.port or 80
+    except Exception:
+        return "\n".join(lines + ["Configured address is not a valid URL."])
+    # 1) raw TCP, on the configured host and on the other loopback flavour
+    alts = [host] + [h for h in ("127.0.0.1", "::1") if h != host]
+    for h in alts:
+        try:
+            with socket.create_connection((h, port), timeout=3): pass
+            lines.append(f"TCP {h}:{port}: accepted")
+        except Exception as e:
+            lines.append(f"TCP {h}:{port}: " + _jd_classify(e))
+    # 2) HTTP: any reply at all, then the API call the bot uses
+    try:
+        r = requests.get(base + "/", timeout=5)
+        lines.append(f"HTTP GET /: status {r.status_code}")
+    except Exception as e:
+        lines.append("HTTP GET /: " + _jd_classify(e))
+    try:
+        r = requests.post(base + "/downloadcontroller/getCurrentState", json={"params": []}, timeout=8)
+        try: d = r.json()
+        except Exception: d = None
+        if isinstance(d, dict) and "data" in d and d.get("type") is None:
+            lines.append(f"API call: OK (status {r.status_code}, controller state {str(d['data'])[:20]})")
+        else:
+            lines.append(f"API call: status {r.status_code}, reply " + ("JSON but not the expected shape" if d is not None else "not JSON"))
+    except Exception as e:
+        lines.append("API call: " + _jd_classify(e))
+    return "\n".join(lines)
+
 def _jd_blocking_download(url: str, job_dir: str, pkg_name: str, cancel_flag: list, progress_cb) -> str:
     """Runs in a worker thread. Returns the downloaded file path or raises _JDError."""
     jd = _JDClient()
@@ -2982,8 +3047,9 @@ async def _do_dl_via_jdownloader(url: str, status_msg, cancel_flag: list, uid: i
         return True
     except Exception as e:
         logging.warning(f"JDownloader unexpected error: {type(e).__name__}")
-        _diag(uid, "JDownloader", "launch", "not reachable or API disabled")
-        await safe_final(status_msg, "❌ JDownloader failed (is it running with the API enabled?)." + _diag_summary(uid))
+        _jwhy = _jd_classify(e)
+        _diag(uid, "JDownloader", "launch", _jwhy)
+        await safe_final(status_msg, f"❌ JDownloader request failed: {_jwhy}. Send /jdtest for a harmless connection check." + _diag_summary(uid))
         return True
     finally:
         # job-specific cleanup: only the folder this job created
@@ -3797,6 +3863,11 @@ async def _convert_reply(reply_msg, spec: dict, u: Update):
 
 # ── DRM COMMANDS ──────────────────────────────────────
 
+async def jdtest_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(u.effective_user.id): return
+    txt = await asyncio.to_thread(_jd_selftest)
+    await u.message.reply_text("JDownloader connection check\n\n" + txt)
+
 async def status_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     with get_db() as conn:
         cur = conn.cursor()
@@ -4402,6 +4473,7 @@ async def main():
     app.add_handler(CommandHandler(["ep", "resetep"], resetep_cmd))
     app.add_handler(CommandHandler("help",      help_cmd))
     app.add_handler(CommandHandler("status",    status_cmd))
+    app.add_handler(CommandHandler("jdtest",    jdtest_cmd))
     app.add_handler(CommandHandler("limits",    limits_cmd))
     app.add_handler(CommandHandler("files",     files_cmd))
     app.add_handler(CommandHandler("search",    search_cmd))
