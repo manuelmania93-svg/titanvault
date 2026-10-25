@@ -19,7 +19,7 @@ def seed():
     tv._diag(7, "HLS via N_m3u8DL-RE", "probe failed", "playlist fetch - HTTP 403 (exe request)")
 
 def block(msg):
-    return msg.last.split("*Diagnostics", 1)[1] if "*Diagnostics" in msg.last else ""
+    return msg.last.split("Diagnostics", 1)[1] if "Diagnostics" in msg.last else ""
 
 async def run(exc=None, path=None, flag=None):
     def stub(*a, **k):

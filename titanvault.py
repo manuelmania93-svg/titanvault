@@ -192,7 +192,7 @@ def _diag(uid, leg: str, stage: str, detail: str):
 def _diag_summary(uid) -> str:
     entries = dl_diag.get(uid) or []
     if not entries: return ""
-    lines = ["", "*Diagnostics (safe to share - no links or tokens):*"]
+    lines = ["", "Diagnostics (safe to share - no links or tokens):"]
     eng = [i for i, e in enumerate(entries) if e[0].startswith("HLS via N_m3u8DL-RE")]
     keep = set(eng[-3:])                                   # engine entries are never trimmed away
     for i in range(len(entries) - 1, -1, -1):
@@ -416,15 +416,21 @@ def _msg_key(msg):
     return (getattr(msg, "chat_id", None), getattr(msg, "message_id", None) or id(msg))
 
 
-async def safe_final(msg, text: str, reply_markup=None, parse_mode="Markdown") -> bool:
-    """Deliver a FINAL status message (failure/cancel). Never raises, returns True when delivered.
+_deferred_finals: set = set()
+_FINAL_MAX_DEFER = 3600.0
 
-    Unlike safe_edit this does not drop the message on a timeout or flood wait:
-    - Markdown rejected -> same text as plain.
-    - RetryAfter -> wait the requested time (bounded to _FINAL_MAX_WAIT per wait) and retry.
-    - TimedOut/NetworkError -> bounded retries; an edit is idempotent, so a retry after an
-      edit that actually landed answers 'message is not modified', which counts as delivered.
-    - Edit still failing -> one new reply (fallback). If the edit had in fact landed but the
+
+async def safe_final(msg, text: str, reply_markup=None, parse_mode=None, _deferred: bool = False) -> bool:
+    """Deliver a FINAL status message (failure/cancel). Never raises; True when delivered now.
+
+    Plain text by default (parse_mode=None), so formatting characters such as the underscores in
+    engine names can never get a final message rejected.
+    - RetryAfter within _FINAL_MAX_WAIT -> wait the requested time and retry (max 3 tries).
+    - RetryAfter beyond it -> NO further network call now (neither edit nor reply): one fixed
+      warning, and a single deferred delivery after the server's deadline (if <= _FINAL_MAX_DEFER).
+    - TimedOut/NetworkError -> bounded retries; an edit is idempotent, so a retry after an edit
+      that actually landed answers 'not modified', which counts as delivered.
+    - Edit still failing -> one new reply (same rules). If the edit had in fact landed but the
       network hid it, that can leave a duplicate final message (accepted, rare).
     Warnings carry only fixed text and exception class names - never exception text/URLs/paths.
     """
@@ -432,48 +438,59 @@ async def safe_final(msg, text: str, reply_markup=None, parse_mode="Markdown") -
         return "not modified" in str(exc).lower()
 
     async def _attempt(call, label):
+        """-> ('ok', 0) | ('fail', 0) | ('defer', seconds)"""
         plain = False
         for n in range(3):
             try:
                 await call(None if plain else parse_mode)
-                return True
+                return "ok", 0
             except RetryAfter as e:
-                wait = min(float(getattr(e, "retry_after", 1) or 1) + 1, _FINAL_MAX_WAIT)
-                logging.warning(f"final message {label}: Telegram rate limit, waiting {int(wait)}s (try {n + 1}/3)")
-                if float(getattr(e, "retry_after", 1) or 1) > _FINAL_MAX_WAIT:
-                    return False
-                await asyncio.sleep(wait)
+                ra = float(getattr(e, "retry_after", 1) or 1)
+                if ra > _FINAL_MAX_WAIT:
+                    logging.warning(f"final message {label}: Telegram rate limit of {int(ra)}s is over the wait budget, deferring")
+                    return "defer", ra
+                logging.warning(f"final message {label}: Telegram rate limit, waiting {int(ra) + 1}s (try {n + 1}/3)")
+                await asyncio.sleep(ra + 1)
             except BadRequest as e:      # BadRequest subclasses NetworkError: must be handled first
                 if _unmodified(e):
-                    return True
+                    return "ok", 0
                 if not plain and parse_mode:
                     plain = True      # formatting rejected: retry the same text as plain
                     continue
                 logging.warning(f"final message {label}: rejected by Telegram")
-                return False
+                return "fail", 0
             except (NetworkError, TimedOut) as e:
                 logging.warning(f"final message {label}: network problem {type(e).__name__} (try {n + 1}/3)")
                 await asyncio.sleep(1.0 + n)
             except Exception as e:
-                if _unmodified(e):
-                    return True
-                if not plain and parse_mode:
-                    plain = True      # formatting rejected: retry the same text as plain
-                    continue
-                logging.warning(f"final message {label}: rejected {type(e).__name__}")
-                return False
-        return False
+                logging.warning(f"final message {label}: failed {type(e).__name__}")
+                return "fail", 0
+        return "fail", 0
 
-    ok = await _attempt(lambda pm: msg.edit_text(text, reply_markup=reply_markup, parse_mode=pm), "edit")
-    if not ok:
+    async def _deferred_task(delay):
+        try:
+            await asyncio.sleep(delay + 1)
+            await safe_final(msg, text, reply_markup, parse_mode, _deferred=True)
+        except Exception:
+            pass
+
+    res, wait = await _attempt(lambda pm: msg.edit_text(text, reply_markup=reply_markup, parse_mode=pm), "edit")
+    if res == "fail":
         logging.warning("final message: edit failed, sending a new reply instead")
-        ok = await _attempt(lambda pm: msg.reply_text(text, parse_mode=pm), "reply")
-        if not ok:
-            logging.warning("final message: could not be delivered to Telegram")
+        res, wait = await _attempt(lambda pm: msg.reply_text(text, parse_mode=pm), "reply")
+    if res == "defer":
+        if not _deferred and wait <= _FINAL_MAX_DEFER:
+            logging.warning(f"final message: delivery deferred by {int(wait) + 1}s (no network call until then)")
+            t = asyncio.ensure_future(_deferred_task(wait)); _deferred_finals.add(t)
+            t.add_done_callback(_deferred_finals.discard)
+        else:
+            logging.warning("final message: rate limit too long, not delivered")
+    elif res == "fail":
+        logging.warning("final message: could not be delivered to Telegram")
     if len(_finalized_at) > 500:
         _finalized_at.clear()
     _finalized_at[_msg_key(msg)] = time.time()
-    return ok
+    return res == "ok"
 
 
 async def safe_copy(bot, to_chat_id: int, from_chat_id: int, message_id: int, **kwargs):
@@ -3141,7 +3158,7 @@ async def _do_dl(url: str, reply_msg, chat_id: int):
             await safe_final(status, "⛔ Cancelled.")
         else:
             logging.error(f"DL error: {e}", exc_info=True)
-            await safe_final(status, f"❌ Error: {str(e)[:180]}")
+            await safe_final(status, f"❌ Error: {type(e).__name__} ({_diag_detail(e)})" + _diag_summary(uid))
     finally:
         dl_tasks.pop(uid, None)
         dl_cancel_flags.pop(uid, None)
