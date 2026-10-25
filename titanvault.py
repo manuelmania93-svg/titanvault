@@ -2803,9 +2803,10 @@ async def _do_dl_via_jdownloader(url: str, status_msg, cancel_flag: list, uid: i
         else:
             logging.warning(f"JDownloader: {e}")
             _low = str(e).lower()
-            _diag(uid, "JDownloader", "download", "link offline or unsupported" if "offline" in _low or "unsupported" in _low
-                  else "timeout" if "timed out" in _low or "timeout" in _low else "download error")
-            await safe_edit(status_msg, f"❌ JDownloader could not get this link ({str(e)[:100]})." + _diag_summary(uid), force=True)
+            _why = ("link offline or unsupported" if "offline" in _low or "unsupported" in _low
+                    else "timeout" if "timed out" in _low or "timeout" in _low else "download error")
+            _diag(uid, "JDownloader", "download", _why)
+            await safe_edit(status_msg, f"❌ JDownloader could not get this link ({_why})." + _diag_summary(uid), force=True)
         return True
     except Exception as e:
         logging.warning(f"JDownloader unexpected error: {type(e).__name__}")

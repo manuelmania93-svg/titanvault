@@ -38,6 +38,8 @@ async def main():
     seed(); r, m = await run(tv._JDError("JDownloader error: http://h/x.m3u8?token=SECRETJD"))
     b = block(m)
     ok("SECRETJD" not in b and "http" not in b and "download error" in b, "diagnostics block never carries URL/token text from the error")
+    seed(); r, m = await run(tv._JDError("offline https://h/x.m3u8?token=SECRETJD C:\\Users\\priv\\f.mp4 /home/priv/f"))
+    ok(all(t not in m.last for t in ("SECRETJD", "http", "priv", "C:\\")) and "could not get this link (link offline or unsupported)" in m.last, "whole message (not just block) has no URL/token/private path from the exception")
     seed(); r, m = await run(tv._JDError("timed out downloading"))
     ok("JDownloader: download - timeout" in block(m), "timeout state recorded")
     seed(); r, m = await run(RuntimeError("boom http://h/SECRETJD"))
