@@ -149,8 +149,48 @@ async def main():
     r, up = await run(f"{BASE}/same/master.m3u8", title="s1")
     ok(r and up and up[2] == "1280,720" and up[1].count("audio") == 1, "same-size variants + two audio renditions: one 720p video, exactly one audio stream")
     r, up = await run(f"{BASE}/nosize/master.m3u8", title="n1")
-    ok(not r and not up and "resolution policy" in tv._diag_summary(7), "master without RESOLUTION: leg skipped with diagnostic, nothing downloaded")
+    ok(not r and not up and "skipped before launch - variant sizes unknown" in tv._diag_summary(7), "master without RESOLUTION: leg skipped with diagnostic, nothing downloaded")
     ok(not [x for x in os.listdir(tv.ARIA2C_DOWNLOAD_DIR) if x.startswith("nm_")], "skipped run created no job dir")
+
+    # ---------- explicit state diagnostics ----------
+    ok("started - exe launched" in (await run(f"{BASE}/segdeny/master.m3u8", title="x1"), tv._diag_summary(7))[1], "failure after launch shows 'started' then the stage")
+    r, up = await run(f"{BASE}/deny/master.m3u8?token=SECRETZ", title="x2")
+    d = tv._diag_summary(7)
+    ok("skipped before launch - manifest HTTP 403 (bot pre-fetch)" in d and "started" not in d and "SECRETZ" not in d, "pre-fetch 403: 'skipped before launch', exe never started, no token")
+    # exit code: fake exe that exits 3 silently
+    fake = os.path.join(FX, "fakeexe"); open(fake, "w").write("#!/bin/sh\necho 'Response status code does not indicate success: 500'\nexit 3\n"); os.chmod(fake, 0o755)
+    tv._NM_BIN_CACHE[:] = [fake, True]
+    r, up = await run(f"{BASE}/mux/master.m3u8", title="x3")
+    d = tv._diag_summary(7)
+    ok(not r and "started" in d and "exit code 3" in d and "HTTP 500" in d, "non-zero exit reported with exit code and HTTP status")
+    # launch failure: file that cannot be executed
+    bad = os.path.join(FX, "notexe"); open(bad, "w").write("x"); os.chmod(bad, 0o644)
+    tv._NM_BIN_CACHE[:] = [bad, True]
+    r, up = await run(f"{BASE}/mux/master.m3u8", title="x4")
+    d = tv._diag_summary(7)
+    ok(not r and "launch failed - PermissionError" in d and "started" not in d and FX not in d, "launch failure: OSError type/errno only, no path, not 'started'")
+    ok(not [x for x in os.listdir(tv.ARIA2C_DOWNLOAD_DIR) if x.startswith("nm_")], "launch failure leaves no job dir")
+    # not installed / disabled
+    tv._NM_BIN_CACHE[:] = [None, True]
+    r, up = await run(f"{BASE}/mux/master.m3u8", title="x5")
+    ok(not r and "not installed - exe not found" in tv._diag_summary(7), "missing exe is reported")
+    tv.N_M3U8DL_MODE = "off"
+    r, up = await run(f"{BASE}/mux/master.m3u8", title="x6")
+    ok(not r and "disabled - N_M3U8DL_MODE=off" in tv._diag_summary(7), "mode off is reported")
+    ok("disabled" in tv._nm_startup_line(), "startup line: disabled")
+    tv.N_M3U8DL_MODE = "fallback"
+    tv._NM_BIN_CACHE[:] = [None, True]
+    ok("not found" in tv._nm_startup_line() and os.path.expanduser("~") not in tv._nm_startup_line(), "startup line: not found, no private path")
+    tv._NM_BIN_CACHE[:] = [NM_BIN, True]
+    sl = tv._nm_startup_line()
+    ok(sl.startswith("N_m3u8DL-RE: found (folder ") and os.path.dirname(NM_BIN) not in sl, "startup line: found shows folder name only")
+    # final message rendering never trims the engine entry
+    tv._diag_reset(7)
+    tv._diag(7, "HLS via N_m3u8DL-RE", "not installed", "exe not found")
+    for i in range(12): tv._diag(7, "yt-dlp native", "page extract", f"HTTP {400+i}")
+    out = tv._diag_summary(7)
+    ok("N_m3u8DL-RE: not installed" in out and out.count("•") == 8 and "HTTP 411" in out, "summary keeps old engine entry, still 8 lines, newest kept")
+    tv._NM_BIN_CACHE[:] = [NM_BIN, True]
     # header fidelity: the origin only answers when Referer matches
     SEEN.clear()
     r, up = await run(f"{BASE}/need/master.m3u8", title="t4", referer="http://ref.example/p", extra_headers={"Origin": "http://ref.example", "X-Evil": "1"})

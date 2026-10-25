@@ -193,7 +193,13 @@ def _diag_summary(uid) -> str:
     entries = dl_diag.get(uid) or []
     if not entries: return ""
     lines = ["", "*Diagnostics (safe to share - no links or tokens):*"]
-    for leg, stage, detail in entries[-8:]:
+    eng = [i for i, e in enumerate(entries) if e[0].startswith("HLS via N_m3u8DL-RE")]
+    keep = set(eng[-3:])                                   # engine entries are never trimmed away
+    for i in range(len(entries) - 1, -1, -1):
+        if len(keep) >= 8: break
+        keep.add(i)
+    for i in sorted(keep):
+        leg, stage, detail = entries[i]
         lines.append(f"• {leg}: {stage} - {detail}")
     return "\n".join(lines)
 save_queues:    dict = {}
@@ -2250,8 +2256,8 @@ async def _do_dl_via_ffmpeg_hls(url: str, status_msg, cancel_flag: list, uid: in
         _diag(uid, "HLS via ffmpeg", "download", _diag_detail(e))
         logging.warning(f"[FFmpeg core error]: {e}")
 
-    # Last HLS leg: external N_m3u8DL-RE (skipped when the binary is not installed or mode is off)
-    if N_M3U8DL_MODE != "off" and _nm_find_binary():
+    # Last HLS leg: external N_m3u8DL-RE (reports "disabled" / "not installed" itself)
+    if True:
         if await _do_dl_via_nm3u8dl(url, status_msg, cancel_flag, uid, chat_id, page_url=page_url, title=title, referer=referer, extra_headers=extra_headers):
             return True
 
@@ -2394,9 +2400,12 @@ async def _do_dl_via_nm3u8dl(url: str, status_msg, cancel_flag: list, uid: int, 
     """HLS/DASH via the external N_m3u8DL-RE binary. Output is validated with ffprobe and handed to
     _finish_upload like every other leg. Returns False (with a diagnostic) on any failure."""
     leg = "HLS via N_m3u8DL-RE"
-    if N_M3U8DL_MODE == "off": return False
+    if N_M3U8DL_MODE == "off":
+        _diag(uid, leg, "disabled", "N_M3U8DL_MODE=off")
+        return False
     binary = _nm_find_binary()
     if not binary:
+        _diag(uid, leg, "not installed", "exe not found")
         return False
     _canon = {"user-agent": "User-Agent", "referer": "Referer", "origin": "Origin",
               "accept": "Accept", "accept-language": "Accept-Language"}
@@ -2420,10 +2429,10 @@ async def _do_dl_via_nm3u8dl(url: str, status_msg, cancel_flag: list, uid: int, 
         kind, target = _nm_policy(txt)
     except Exception as e:
         code = getattr(getattr(e, "response", None), "status_code", None)
-        _diag(uid, leg, "playlist fetch", f"HTTP {code}" if code else _diag_detail(e))
+        _diag(uid, leg, "skipped before launch", f"manifest HTTP {code} (bot pre-fetch)" if code else f"manifest {_diag_detail(e)} (bot pre-fetch)")
         return False
     if kind == "unknown":
-        _diag(uid, leg, "resolution policy", "variant sizes unknown - skipped")
+        _diag(uid, leg, "skipped before launch", "variant sizes unknown")
         return False
     job_dir = os.path.join(ARIA2C_DOWNLOAD_DIR, f"nm_{uid}_{int(time.time())}")
     os.makedirs(job_dir, exist_ok=True)
@@ -2433,9 +2442,15 @@ async def _do_dl_via_nm3u8dl(url: str, status_msg, cancel_flag: list, uid: int, 
     tail, selected_seen, last_edit, pct_txt = "", False, [0.0], [""]
     try:
         await safe_edit(status_msg, f"📥 *Step 2/4: Retrying stream with N_m3u8DL-RE...*\n*{_safe_title[:40]}*", force=True)
-        proc = await asyncio.create_subprocess_exec(
-            binary, *args, stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, cwd=job_dir)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                binary, *args, stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, cwd=job_dir)
+        except (OSError, NotImplementedError) as e:
+            code = getattr(e, "winerror", None) or getattr(e, "errno", None)
+            _diag(uid, leg, "launch failed", f"{type(e).__name__}" + (f" {code}" if code else ""))
+            return False
+        _diag(uid, leg, "started", "exe launched")
 
         async def _reader():
             nonlocal tail, selected_seen
@@ -2476,6 +2491,7 @@ async def _do_dl_via_nm3u8dl(url: str, status_msg, cancel_flag: list, uid: int, 
         if proc.returncode != 0 or not good:
             stage, detail = _nm_classify(tail, selected_seen)
             if proc.returncode == 0: stage, detail = "output check", "no video stream in output"
+            elif proc.returncode is not None: detail = f"{detail} (exit code {proc.returncode})"
             _diag(uid, leg, stage, detail)
             return False
         out = max(good, key=os.path.getsize)
@@ -4152,8 +4168,15 @@ async def unpair_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
         conn.commit()
     await u.message.reply_text(f"🔌 Revoked {n} paired browser(s).")
 
+def _nm_startup_line() -> str:
+    if N_M3U8DL_MODE == "off": return "N_m3u8DL-RE: disabled (N_M3U8DL_MODE=off)"
+    b = _nm_find_binary()
+    if b: return f"N_m3u8DL-RE: found (folder {os.path.basename(os.path.dirname(b)) or '.'})"
+    return "N_m3u8DL-RE: not found (looked in the Downloads folder for a win-x64 folder, next to this script, and on PATH)"
+
 async def main():
     init_db()
+    print(f"{Fore.CYAN}{_nm_startup_line()}{Style.RESET_ALL}")
 
     await tgclient.start()
     me = await tgclient.get_me()
