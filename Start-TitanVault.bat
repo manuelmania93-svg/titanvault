@@ -9,6 +9,10 @@ rem   2. In JDownloader: Settings -^> Advanced Settings -^>
 rem      set RemoteAPI.deprecatedapienabled = true
 rem      (leave port 3128, keep localhost-only enabled).
 rem  This file does not configure JDownloader for you.
+rem
+rem  Optional HLS engine: keep the extracted N_m3u8DL-RE win-x64 folder in
+rem  Downloads (found automatically), or set N_M3U8DL_PATH to the .exe.
+rem  It runs only after the yt-dlp and FFmpeg steps fail. N_M3U8DL_MODE=off disables it.
 rem ============================================================
 cd /d "%~dp0"
 

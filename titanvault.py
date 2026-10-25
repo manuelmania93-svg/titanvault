@@ -90,6 +90,14 @@ JD_TIMEOUT_SEC     = int(os.getenv("JD_TIMEOUT_SEC", "3600"))
 BRIDGE_ENABLE      = os.getenv("BRIDGE_ENABLE", "1") != "0"
 BRIDGE_PORT        = int(os.getenv("BRIDGE_PORT", "8765"))
 BRIDGE_EXT_ID      = os.getenv("BRIDGE_EXT_ID", "").strip()   # optional: pin your extension ID
+# ── N_m3u8DL-RE (optional one-time external HLS/DASH engine, experimental) ──
+# Used as an extra HLS/DASH leg AFTER yt-dlp and FFmpeg have failed (N_M3U8DL_MODE=off disables it). Binary lookup: N_M3U8DL_PATH, then next to this script, PATH,
+# then ~/Downloads/N_m3u8DL-RE*win-x64*. Missing binary = leg silently skipped.
+N_M3U8DL_MODE      = os.getenv("N_M3U8DL_MODE", "fallback").strip().lower()
+N_M3U8DL_PATH      = os.getenv("N_M3U8DL_PATH", "").strip()
+N_M3U8DL_THREADS   = int(os.getenv("N_M3U8DL_THREADS", "8"))
+N_M3U8DL_TIMEOUT_SEC = int(os.getenv("N_M3U8DL_TIMEOUT_SEC", "7200"))
+
 MAX_PARALLEL_DOWNLOADS = 3
 DOWNLOAD_QUEUE_WORKERS = 2
 
@@ -2242,7 +2250,224 @@ async def _do_dl_via_ffmpeg_hls(url: str, status_msg, cancel_flag: list, uid: in
         _diag(uid, "HLS via ffmpeg", "download", _diag_detail(e))
         logging.warning(f"[FFmpeg core error]: {e}")
 
+    # Last HLS leg: external N_m3u8DL-RE (skipped when the binary is not installed or mode is off)
+    if N_M3U8DL_MODE != "off" and _nm_find_binary():
+        if await _do_dl_via_nm3u8dl(url, status_msg, cancel_flag, uid, chat_id, page_url=page_url, title=title, referer=referer, extra_headers=extra_headers):
+            return True
+
     return False
+
+# ══════════════════════════════════════════════════════
+#  N_m3u8DL-RE LEG (experimental, optional)
+# ══════════════════════════════════════════════════════
+_NM_BIN_CACHE = [None, False]   # [path, looked_up]
+
+def _nm_find_binary() -> str:
+    if _NM_BIN_CACHE[1]:
+        return _NM_BIN_CACHE[0] or ""
+    import glob
+    exe = "N_m3u8DL-RE.exe" if os.name == "nt" else "N_m3u8DL-RE"
+    home = os.path.expanduser("~")
+    cands = []
+    if N_M3U8DL_PATH:
+        cands.append(N_M3U8DL_PATH)
+        if os.path.isdir(N_M3U8DL_PATH): cands.append(os.path.join(N_M3U8DL_PATH, exe))
+    cands.append(os.path.join(_SCRIPT_DIR, exe))
+    found = shutil.which(exe) or shutil.which("N_m3u8DL-RE")
+    if found: cands.append(found)
+    cands += sorted(glob.glob(os.path.join(home, "Downloads", "N_m3u8DL-RE*win-x64*", exe)), reverse=True)
+    path = next((c for c in cands if c and os.path.isfile(c)), "")
+    _NM_BIN_CACHE[0], _NM_BIN_CACHE[1] = path, True
+    return path
+
+def _hls_master_variants(text: str) -> list:
+    """(width, height, bandwidth_bps) for each #EXT-X-STREAM-INF with a RESOLUTION. [] if not a master."""
+    out = []
+    for line in (text or "").splitlines():
+        if not line.startswith("#EXT-X-STREAM-INF"): continue
+        m = re.search(r"RESOLUTION=(\d+)x(\d+)", line)
+        if not m: continue
+        b = re.search(r"(?<![A-Z-])BANDWIDTH=(\d+)", line)
+        out.append((int(m.group(1)), int(m.group(2)), int(b.group(1)) if b else 0))
+    return out
+
+def _pick_policy_variant(variants: list):
+    """Download policy: highest height <=1080; only when nothing is <=1080, the CLOSEST higher
+    height. Returns (width, height) or None. Same policy as YDL_FORMAT."""
+    if not variants: return None
+    low = [v for v in variants if v[1] <= 1080]
+    if low:
+        best = max(low, key=lambda v: (v[1], v[2]))
+    else:
+        best = min(variants, key=lambda v: (v[1], -v[2]))
+    return best[0], best[1]
+
+def _nm_cookie_header(url: str) -> str:
+    """Cookie header from cookies.txt for the URL's host (same file yt-dlp uses). '' if none."""
+    if not COOKIES_FILE: return ""
+    try:
+        host = (urlparse(url).hostname or "").lower()
+        pairs = [f"{c['name']}={c['value']}" for c in _parse_netscape_cookies(COOKIES_FILE)
+                 if host == c["domain"].lower() or host.endswith("." + c["domain"].lower())]
+        return "; ".join(pairs)[:3000]
+    except Exception:
+        return ""
+
+def _nm_build_args(url: str, job_dir: str, headers: dict, target, ffmpeg_bin: str = "") -> list:
+    """Arguments after the executable. target = (w, h) from the policy picker or None.
+    Selectors are always given (the tool prompts / crashes headless without them)."""
+    args = [url,
+            "--save-dir", job_dir, "--save-name", "nm", "--tmp-dir", os.path.join(job_dir, "tmp"),
+            "--thread-count", str(max(1, N_M3U8DL_THREADS)), "--download-retry-count", "3",
+            "--http-request-timeout", "30", "--no-log", "--no-ansi-color", "--del-after-done"]
+    if ffmpeg_bin: args += ["--ffmpeg-binary-path", ffmpeg_bin]
+    for k, v in headers.items():
+        v = re.sub(r"[\r\n]", "", str(v)).strip()
+        if v: args += ["-H", f"{k}: {v}"]
+    if target:
+        args += ["-sv", f'res="^{target[0]}x{target[1]}$":for=best']
+    else:
+        args += ["-sv", "best"]
+    args += ["-sa", "best", "-ds", "for=all", "-M", "format=mp4:muxer=ffmpeg"]
+    return args
+
+def _nm_classify(output_tail: str, selected_seen: bool):
+    """(stage, detail) from a fixed vocabulary - raw tool output (may hold URLs) is never reported."""
+    m = re.search(r"status code[^:\n]*:\s*(\d{3})", output_tail, re.I) or re.search(r"HTTP (\d{3})", output_tail)
+    low = output_tail.lower()
+    stage = "segment fetch" if selected_seen else "playlist fetch"
+    if m: return stage, f"HTTP {m.group(1)}"
+    if "timed out" in low or "timeout" in low or "canceled" in low: return stage, "timeout"
+    if any(x in low for x in ("name or service", "no such host", "connection", "refused", "unreachable")): return stage, "connection error"
+    if "drm" in low or "encrypted" in low or "key" in low and "decrypt" in low: return "decrypt", "encrypted stream (not supported)"
+    if "ffmpeg" in low and ("not found" in low or "not exist" in low): return "merge", "ffmpeg not found"
+    if "merg" in low or "mux" in low: return "merge", "merge error"
+    return stage, "download error"
+
+def _kill_proc_tree(proc):
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, timeout=15)
+        else:
+            proc.kill()
+    except Exception:
+        try: proc.kill()
+        except Exception: pass
+
+def _probe_stream_kinds(path: str) -> list:
+    try:
+        r = subprocess.run([FFPROBE_PATH, "-v", "error", "-show_entries", "stream=codec_type", "-of", "json", path],
+                           capture_output=True, text=True, timeout=30)
+        return [s.get("codec_type") for s in json.loads(r.stdout).get("streams", [])]
+    except Exception:
+        return []
+
+async def _do_dl_via_nm3u8dl(url: str, status_msg, cancel_flag: list, uid: int, chat_id: int, page_url: str = "",
+                             title: str = "", referer: str = "", extra_headers: dict = None) -> bool:
+    """HLS/DASH via the external N_m3u8DL-RE binary. Output is validated with ffprobe and handed to
+    _finish_upload like every other leg. Returns False (with a diagnostic) on any failure."""
+    leg = "HLS via N_m3u8DL-RE"
+    if N_M3U8DL_MODE == "off": return False
+    binary = _nm_find_binary()
+    if not binary:
+        return False
+    _canon = {"user-agent": "User-Agent", "referer": "Referer", "origin": "Origin",
+              "accept": "Accept", "accept-language": "Accept-Language"}
+    clean_url = url.replace("&amp;", "&").replace("\\", "").strip()
+    _ref = clean_referer(referer or page_url or clean_url)
+    headers = {"User-Agent": _STANDARD_UA, "Accept-Language": _STANDARD_LANG, "Referer": _ref}
+    headers.update({_canon[str(k).lower()]: str(v)[:500] for k, v in (extra_headers or {}).items()
+                    if str(k).lower() in _canon})
+    ck = _nm_cookie_header(clean_url)
+    if ck: headers["Cookie"] = ck
+    _safe_title = re.sub(r'[\\/*?:"<>|]', "", title).strip() or f"video_{uid}"
+    loop = asyncio.get_running_loop()
+
+    # Resolution policy: read the master playlist ourselves (same headers) and pin the chosen variant.
+    target = None
+    try:
+        def _fetch():
+            r = requests.get(clean_url, headers=headers, timeout=20)
+            r.raise_for_status()
+            return r.text
+        txt = await loop.run_in_executor(None, _fetch)
+        target = _pick_policy_variant(_hls_master_variants(txt))
+    except Exception as e:
+        _diag(uid, leg, "playlist fetch", _diag_detail(e))   # the tool retries it itself below
+    job_dir = os.path.join(ARIA2C_DOWNLOAD_DIR, f"nm_{uid}_{int(time.time())}")
+    os.makedirs(job_dir, exist_ok=True)
+    ffbin = shutil.which(FFMPEG_PATH) or ""
+    args = _nm_build_args(clean_url, job_dir, headers, target, ffbin)
+    proc = None
+    tail, selected_seen, last_edit, pct_txt = "", False, [0.0], [""]
+    try:
+        await safe_edit(status_msg, f"📥 *Step 2/4: Retrying stream with N_m3u8DL-RE...*\n*{_safe_title[:40]}*", force=True)
+        proc = await asyncio.create_subprocess_exec(
+            binary, *args, stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, cwd=job_dir)
+
+        async def _reader():
+            nonlocal tail, selected_seen
+            while True:
+                chunk = await proc.stdout.read(4096)
+                if not chunk: break
+                t = chunk.decode("utf-8", errors="replace")
+                tail = (tail + t)[-6000:]
+                if "Selected streams" in tail: selected_seen = True
+                ms = re.findall(r"(\d+)/(\d+)\s+(\d+(?:\.\d+)?)%", t)
+                if ms:
+                    d, n, pc = ms[-1]
+                    pct_txt[0] = (int(d), int(n), float(pc))
+                    now = time.time()
+                    if now - last_edit[0] >= 2.0:
+                        last_edit[0] = now
+                        pct = int(float(pc)); bar = "▓" * int(16 * pct / 100) + "░" * (16 - int(16 * pct / 100))
+                        await safe_edit(status_msg, f"📥 *Step 2/4: Streaming HLS/DASH Chunks...*\n*{_safe_title[:40]}*\n\n[{bar}] {pct}% ({d}/{n} parts)")
+        rtask = asyncio.ensure_future(_reader())
+        t0 = time.time()
+        while proc.returncode is None:
+            try:
+                await asyncio.wait_for(asyncio.shield(proc.wait()), 1.0)
+            except asyncio.TimeoutError:
+                pass
+            if cancel_flag[0]:
+                raise Exception("__CANCELLED__")
+            if time.time() - t0 > N_M3U8DL_TIMEOUT_SEC:
+                _kill_proc_tree(proc)
+                _diag(uid, leg, "download", "timeout")
+                return False
+        try: await asyncio.wait_for(rtask, 10)
+        except Exception: rtask.cancel()
+        outs = [os.path.join(job_dir, f) for f in os.listdir(job_dir)
+                if os.path.isfile(os.path.join(job_dir, f)) and os.path.getsize(os.path.join(job_dir, f)) > 0]
+        mp4s = [f for f in outs if f.lower().endswith(".mp4")]
+        good = [f for f in mp4s if "video" in _probe_stream_kinds(f)]
+        if proc.returncode != 0 or not good:
+            stage, detail = _nm_classify(tail, selected_seen)
+            if proc.returncode == 0: stage, detail = "output check", "no video stream in output"
+            _diag(uid, leg, stage, detail)
+            return False
+        out = max(good, key=os.path.getsize)
+        return await _finish_upload(out, _safe_title, status_msg, uid, chat_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        if "__CANCELLED__" in str(e): raise
+        _diag(uid, leg, "download", _diag_detail(e))
+        return False
+    finally:
+        if proc is not None and proc.returncode is None:
+            _kill_proc_tree(proc)
+            try: await asyncio.wait_for(proc.wait(), 5)
+            except Exception: pass
+        # _finish_upload keeps a failed-upload source under _KEPT_SOURCES; move nothing here: the job dir
+        # is removed unless it holds a kept source.
+        try:
+            if not any(k.startswith(job_dir) for k in _KEPT_SOURCES):
+                shutil.rmtree(job_dir, ignore_errors=True)
+        except Exception:
+            pass
+
 
 async def _finish_upload(file_path: str, title: str, status_msg, uid: int, chat_id: int, skip_convert: bool = False) -> bool:
     loop  = asyncio.get_running_loop()
