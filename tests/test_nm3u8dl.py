@@ -31,6 +31,21 @@ ff("-f","lavfi","-i","testsrc2=s=3840x2160:r=25:d=2","-f","lavfi","-i","sine=f=5
    "-map","[v0]","-map","[v1]","-map","1:a","-c:v","libx264","-preset","ultrafast","-g","50","-c:a","aac","-b:v:0","3000k","-b:v:1","9000k",
    "-f","hls","-hls_time","2","-hls_playlist_type","vod","-master_pl_name","master.m3u8","-var_stream_map","v:0,agroup:aud v:1,agroup:aud a:0,agroup:aud,default:yes,language:eng",f"{FX}/hi/h%v.m3u8")
 
+os.makedirs(f"{FX}/dash"); os.makedirs(f"{FX}/same"); os.makedirs(f"{FX}/nosize")
+ff("-f","lavfi","-i","testsrc2=s=1920x1080:r=25:d=4","-f","lavfi","-i","sine=f=440:d=4","-filter_complex","[0:v]split=3[a][b][c];[a]scale=640:360[v0];[b]scale=1280:720[v1];[c]copy[v2]",
+   "-map","[v0]","-map","[v1]","-map","[v2]","-map","1:a","-c:v","libx264","-preset","ultrafast","-g","50","-c:a","aac","-b:v:0","400k","-b:v:1","1200k","-b:v:2","3000k",
+   "-f","dash","-seg_duration","2","-adaptation_sets","id=0,streams=v id=1,streams=a",f"{FX}/dash/manifest.mpd")
+# same-size variants (two bitrates at 1280x720) + two audio renditions
+ff("-f","lavfi","-i","testsrc2=s=1280x720:r=25:d=4","-f","lavfi","-i","sine=f=300:d=4","-f","lavfi","-i","sine=f=900:d=4","-filter_complex","[0:v]split=2[a][b]",
+   "-map","[a]","-map","[b]","-map","1:a","-map","2:a","-c:v","libx264","-preset","ultrafast","-g","50","-c:a","aac","-b:v:0","500k","-b:v:1","2500k",
+   "-f","hls","-hls_time","2","-hls_playlist_type","vod","-master_pl_name","master.m3u8",
+   "-var_stream_map","v:0,agroup:aud v:1,agroup:aud a:0,agroup:aud,default:yes,language:eng a:1,agroup:aud,language:deu",f"{FX}/same/s%v.m3u8")
+# master without RESOLUTION: strip it from the muxed fixture
+import re as _re
+m = open(f"{FX}/mux/master.m3u8").read()
+open(f"{FX}/nosize/master.m3u8","w").write(_re.sub(r",RESOLUTION=\d+x\d+","",m))
+for f in os.listdir(f"{FX}/mux"):
+    if f != "master.m3u8": shutil.copy(f"{FX}/mux/{f}", f"{FX}/nosize/{f}")
 SEEN = []   # (path, headers)
 class H(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"
@@ -88,6 +103,13 @@ ok(tv._nm_classify("Selected streams: ... status code does not indicate success:
 leak = tv._nm_classify("Loading URL: http://x/secret-token-abc.m3u8 refused", False)
 ok("secret" not in " ".join(leak), "classify never echoes URLs")
 ok(tv._nm_find_binary() == NM_BIN, "binary lookup honours N_M3U8DL_PATH")
+ok(tv._nm_policy(M)[0] == "pin", "policy: master with sizes -> pin")
+ok(tv._nm_policy(M.replace(",RESOLUTION=640x360", ""))[0] == "unknown", "policy: any variant without RESOLUTION -> unknown (skip)")
+ok(tv._nm_policy("#EXTM3U\n#EXTINF:2,\nx.ts\n") == ("single", None), "policy: plain media playlist -> single stream, no choice")
+ok(tv._nm_policy("<html>nope</html>")[0] == "unknown" and tv._nm_policy("")[0] == "unknown", "policy: unrecognised manifest -> unknown")
+ok(tv._nm_policy('<MPD><Period><AdaptationSet mimeType="video/mp4"><Representation id="a" bandwidth="5"/></AdaptationSet></Period></MPD>')[0] == "unknown", "policy: DASH without width/height -> unknown")
+_mpd = '<MPD><Period><AdaptationSet contentType="video" mimeType="video/mp4"><Representation id="0" bandwidth="1" width="1280" height="720"/><Representation id="1" bandwidth="2" width="2560" height="1440"/></AdaptationSet><AdaptationSet mimeType="audio/mp4"><Representation id="2" bandwidth="9" width="9999" height="9999"/></AdaptationSet></Period></MPD>'
+ok(tv._nm_policy(_mpd) == ("pin", (1280, 720)), "policy: DASH picks 720 (<=1080), audio set ignored")
 
 # discovery: a win-x64 folder in Downloads is found, the win-arm64 one never is
 _fh = tempfile.mkdtemp(prefix="nmhome_")
@@ -122,6 +144,13 @@ async def main():
     ok(r and up and up[2] == "1280,720" and "audio" in up[1] and "video" in up[1], "separate audio group: 720p (<=1080 preferred over 1440) merged with audio")
     r, up = await run(f"{BASE}/hi/master.m3u8", title="t3")
     ok(r and up and up[2] == "2560,1440" and "audio" in up[1], "only >1080 sources: closest higher (1440) chosen, audio merged")
+    r, up = await run(f"{BASE}/dash/manifest.mpd", title="d1")
+    ok(r and up and up[2] == "1920,1080" and "audio" in up[1] and "video" in up[1], "DASH fixture: 1080p variant pinned, video+audio merged")
+    r, up = await run(f"{BASE}/same/master.m3u8", title="s1")
+    ok(r and up and up[2] == "1280,720" and up[1].count("audio") == 1, "same-size variants + two audio renditions: one 720p video, exactly one audio stream")
+    r, up = await run(f"{BASE}/nosize/master.m3u8", title="n1")
+    ok(not r and not up and "resolution policy" in tv._diag_summary(7), "master without RESOLUTION: leg skipped with diagnostic, nothing downloaded")
+    ok(not [x for x in os.listdir(tv.ARIA2C_DOWNLOAD_DIR) if x.startswith("nm_")], "skipped run created no job dir")
     # header fidelity: the origin only answers when Referer matches
     SEEN.clear()
     r, up = await run(f"{BASE}/need/master.m3u8", title="t4", referer="http://ref.example/p", extra_headers={"Origin": "http://ref.example", "X-Evil": "1"})

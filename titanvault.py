@@ -2291,6 +2291,44 @@ def _hls_master_variants(text: str) -> list:
         out.append((int(m.group(1)), int(m.group(2)), int(b.group(1)) if b else 0))
     return out
 
+def _dash_variants(text: str) -> list:
+    """(width, height, bandwidth) for video Representations of an MPD (attributes on the
+    Representation, or inherited from its AdaptationSet). [] when absent."""
+    out = []
+    for aset in re.findall(r"<AdaptationSet\b.*?</AdaptationSet>", text or "", re.S):
+        head = re.match(r"<AdaptationSet\b[^>]*>", aset).group(0)
+        def at(tag, name):
+            m = re.search(r'\b%s="([^"]*)"' % name, tag)
+            return m.group(1) if m else ""
+        for rep in re.findall(r"<Representation\b[^>]*>", aset):
+            mime = at(rep, "mimeType") or at(head, "mimeType") or at(head, "contentType")
+            codecs = at(rep, "codecs") or at(head, "codecs")
+            if mime and "video" not in mime and not (codecs[:4] in ("avc1", "hvc1", "hev1", "av01", "vp09")): continue
+            w = at(rep, "width") or at(head, "width"); h = at(rep, "height") or at(head, "height")
+            bw = at(rep, "bandwidth")
+            if w.isdigit() and h.isdigit():
+                out.append((int(w), int(h), int(bw) if bw.isdigit() else 0))
+    return out
+
+def _nm_policy(text: str):
+    """Decide how to select a video track from the manifest text. Returns ("pin", (w, h)),
+    ("single", None) when there is no choice to make (one media playlist), or ("unknown", None)
+    when the 1080p policy cannot be applied from verified metadata (the leg is then skipped)."""
+    t = text or ""
+    if "#EXT-X-STREAM-INF" in t:
+        n_inf = len(re.findall(r"^#EXT-X-STREAM-INF", t, re.M))
+        vs = _hls_master_variants(t)
+        if vs and len(vs) == n_inf: return "pin", _pick_policy_variant(vs)
+        return "unknown", None
+    if "#EXTINF" in t: return "single", None
+    if "<MPD" in t:
+        vs = _dash_variants(t)
+        n_rep = len(re.findall(r"<Representation\b", t))
+        if vs and n_rep >= len(vs):
+            if len(set((w, h) for w, h, _ in vs)) == 1 and len(vs) == 1: return "single", None
+            return "pin", _pick_policy_variant(vs)
+    return "unknown", None
+
 def _pick_policy_variant(variants: list):
     """Download policy: highest height <=1080; only when nothing is <=1080, the CLOSEST higher
     height. Returns (width, height) or None. Same policy as YDL_FORMAT."""
@@ -2301,17 +2339,6 @@ def _pick_policy_variant(variants: list):
     else:
         best = min(variants, key=lambda v: (v[1], -v[2]))
     return best[0], best[1]
-
-def _nm_cookie_header(url: str) -> str:
-    """Cookie header from cookies.txt for the URL's host (same file yt-dlp uses). '' if none."""
-    if not COOKIES_FILE: return ""
-    try:
-        host = (urlparse(url).hostname or "").lower()
-        pairs = [f"{c['name']}={c['value']}" for c in _parse_netscape_cookies(COOKIES_FILE)
-                 if host == c["domain"].lower() or host.endswith("." + c["domain"].lower())]
-        return "; ".join(pairs)[:3000]
-    except Exception:
-        return ""
 
 def _nm_build_args(url: str, job_dir: str, headers: dict, target, ffmpeg_bin: str = "") -> list:
     """Arguments after the executable. target = (w, h) from the policy picker or None.
@@ -2378,12 +2405,11 @@ async def _do_dl_via_nm3u8dl(url: str, status_msg, cancel_flag: list, uid: int, 
     headers = {"User-Agent": _STANDARD_UA, "Accept-Language": _STANDARD_LANG, "Referer": _ref}
     headers.update({_canon[str(k).lower()]: str(v)[:500] for k, v in (extra_headers or {}).items()
                     if str(k).lower() in _canon})
-    ck = _nm_cookie_header(clean_url)
-    if ck: headers["Cookie"] = ck
     _safe_title = re.sub(r'[\\/*?:"<>|]', "", title).strip() or f"video_{uid}"
     loop = asyncio.get_running_loop()
 
-    # Resolution policy: read the master playlist ourselves (same headers) and pin the chosen variant.
+    # Resolution policy: read the manifest ourselves (same headers) and pin the chosen variant.
+    # When the policy cannot be applied from verified metadata the leg is skipped, never "best".
     target = None
     try:
         def _fetch():
@@ -2391,9 +2417,14 @@ async def _do_dl_via_nm3u8dl(url: str, status_msg, cancel_flag: list, uid: int, 
             r.raise_for_status()
             return r.text
         txt = await loop.run_in_executor(None, _fetch)
-        target = _pick_policy_variant(_hls_master_variants(txt))
+        kind, target = _nm_policy(txt)
     except Exception as e:
-        _diag(uid, leg, "playlist fetch", _diag_detail(e))   # the tool retries it itself below
+        code = getattr(getattr(e, "response", None), "status_code", None)
+        _diag(uid, leg, "playlist fetch", f"HTTP {code}" if code else _diag_detail(e))
+        return False
+    if kind == "unknown":
+        _diag(uid, leg, "resolution policy", "variant sizes unknown - skipped")
+        return False
     job_dir = os.path.join(ARIA2C_DOWNLOAD_DIR, f"nm_{uid}_{int(time.time())}")
     os.makedirs(job_dir, exist_ok=True)
     ffbin = shutil.which(FFMPEG_PATH) or ""
