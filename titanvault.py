@@ -377,8 +377,14 @@ def prepare_telegram_thumb(image_path: str) -> str:
 
 _FINAL_MAX_WAIT = 30.0
 
+_SEND_SETTLE_SECS = 20  # how long a Cancel waits for an already-sent final upload request to settle
+_status_kb: dict = {}   # message key -> keyboard that every progress edit of that message keeps (Cancel button)
+
 async def safe_edit(msg, text: str, reply_markup=None, parse_mode="Markdown", force: bool = False):
     now = time.time()
+    if reply_markup is None:
+        # edit_text without a markup removes the keyboard: keep the Cancel button through convert/upload edits
+        reply_markup = _status_kb.get(_msg_key(msg))
     if now < _flood_wait_until[0] and not force:
         return
 
@@ -437,6 +443,7 @@ async def safe_final(msg, text: str, reply_markup=None, parse_mode=None, _deferr
       network hid it, that can leave a duplicate final message (accepted, rare).
     Warnings carry only fixed text and exception class names - never exception text/URLs/paths.
     """
+    _status_kb.pop(_msg_key(msg), None)   # a final message never keeps the Cancel button
     def _unmodified(exc):
         return "not modified" in str(exc).lower()
 
@@ -2701,6 +2708,8 @@ async def _finish_upload(file_path: str, title: str, status_msg, uid: int, chat_
     thumb = ""
     tmp   = file_path
     uploaded = False   # SAFETY: the original is only deleted after Telegram confirmed the upload
+    cancelled = False  # the user pressed Cancel while this job was converting or uploading
+    late_note = ""
     media_exts = (".mp4", ".mkv", ".webm", ".mov", ".avi", ".ts", ".flv", ".m4v",
                   ".mp3", ".m4a", ".aac", ".opus", ".ogg", ".wav", ".flac")
     if ext in media_exts and not _probe_has_media_stream(file_path):
@@ -2710,6 +2719,8 @@ async def _finish_upload(file_path: str, title: str, status_msg, uid: int, chat_
         try: os.remove(file_path)
         except Exception: pass
         return False
+    _status_kb[_msg_key(status_msg)] = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("❌ Cancel", callback_data=f"DL_CANCEL|{uid}")]])
     try:
         converted = False
         if is_video and not skip_convert:
@@ -2763,14 +2774,25 @@ async def _finish_upload(file_path: str, title: str, status_msg, uid: int, chat_
         sent = None
         for attempt in range(5):
             try:
-                sent = await tgclient.send_file(
+                send_task = asyncio.ensure_future(tgclient.send_file(
                     STORAGE_CHANNEL_ID,
                     file=input_file,
                     caption=clean_title,
                     supports_streaming=is_video,
                     thumb=thumb if (is_video and thumb) else None,
                     attributes=attrs,
-                )
+                ))
+                try:
+                    sent = await asyncio.shield(send_task)
+                except asyncio.CancelledError:
+                    # Cancel arrived while the final send request was already on its way. It cannot be
+                    # recalled: give it a short moment to settle, then record the real outcome.
+                    try: sent = await asyncio.wait_for(asyncio.shield(send_task), _SEND_SETTLE_SECS)
+                    except BaseException: sent = None
+                    if not sent:
+                        send_task.cancel()
+                        raise asyncio.CancelledError()
+                    late_note = "\nℹ️ Cancel arrived after Telegram had already received the upload, so it completed."
                 break
             except FloodWaitError as fe:
                 _user_flood_until[0] = time.time() + fe.seconds
@@ -2791,7 +2813,8 @@ async def _finish_upload(file_path: str, title: str, status_msg, uid: int, chat_
             conn.commit()
 
         uploaded = True
-        await safe_edit(status_msg, f"✅ *Completed!*\n*{clean_title[:60]}*\n💾 {fmt_size(filesize)}", force=True)
+        _status_kb.pop(_msg_key(status_msg), None)
+        await safe_edit(status_msg, f"✅ *Completed!*\n*{clean_title[:60]}*\n💾 {fmt_size(filesize)}{late_note}", force=True)
 
         reply_kb = None
         if uid in user_thumbnails:
@@ -2807,7 +2830,11 @@ async def _finish_upload(file_path: str, title: str, status_msg, uid: int, chat_
         except Exception:
             try: await tgclient.forward_messages(chat_id, sent.id, from_peer=STORAGE_CHANNEL_ID)
             except Exception: pass
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
     finally:
+        _status_kb.pop(_msg_key(status_msg), None)
         # compressed / remuxed copies are always temporary
         if tmp and tmp != file_path and os.path.exists(tmp):
             try: os.remove(tmp)
@@ -2822,8 +2849,9 @@ async def _finish_upload(file_path: str, title: str, status_msg, uid: int, chat_
                 if _inside_job_dir(file_path):
                     _KEPT_SOURCES.add(file_path)
                     rid = _kept_register(file_path, clean_title, chat_id)
+                    _lead = "⛔ Upload cancelled." if cancelled else "⚠️ Upload not confirmed."
                     await status_msg.reply_text(
-                        f"⚠️ Upload not confirmed. Your file is kept ({fmt_size(os.path.getsize(file_path))}): `{os.path.basename(file_path)[:50]}`",
+                        f"{_lead} Your file is kept ({fmt_size(os.path.getsize(file_path))}): `{os.path.basename(file_path)[:50]}`",
                         parse_mode="Markdown", reply_markup=_kept_kb(rid))
             except Exception as _e:
                 logging.warning(f"Could not register kept file: {type(_e).__name__}")
@@ -4355,7 +4383,15 @@ async def kept_button(q, data: str) -> bool:
         await q.edit_message_text("🗑 Deleted.")
         return True
     await q.edit_message_text("🔁 Retrying upload...")
-    asyncio.create_task(_finish_upload(row[1], row[2], q.message, q.message.chat_id, q.message.chat_id))
+    _cid = q.message.chat_id
+    async def _retry():
+        try: return await _finish_upload(row[1], row[2], q.message, _cid, _cid)
+        except asyncio.CancelledError:
+            await safe_final(q.message, "⛔ Upload cancelled.")
+    _t = asyncio.create_task(_retry())
+    if _cid not in dl_tasks or dl_tasks[_cid].done():
+        dl_tasks[_cid] = _t   # lets the Cancel button reach a retry too
+        _t.add_done_callback(lambda t, c=_cid: dl_tasks.pop(c, None) if dl_tasks.get(c) is t else None)
     return True
 
 async def pair_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
