@@ -9,6 +9,7 @@
 # ======================================================
 
 import logging
+import collections
 import sqlite3
 import os
 import re
@@ -268,9 +269,8 @@ retry_counts: dict = {}
 
 _last_edit_times = {}
 _flood_wait_until = [0.0]
-_MAX_FLOOD_RETRIES = 20          # Telegram flood waits per send; each one is waited out in full
-_RL_MAX_TRIES = 3                # tries per link when the source says "slow down" (HTTP 429)
-_RL_MAX_HOLD = 6 * 3600          # a source asking for a longer wait than this is reported, not retried early
+_RL_MAX_TRIES = 3                # tries per link when the source says "slow down" (HTTP 429); after that the link is HELD, not dropped
+_held_links: dict = {}           # chat_id -> links parked after repeated HTTP 429 (in memory; /held to resume or clear)
 _upload_count: dict = {}         # chat_id -> number of confirmed uploads (to tell success from failure)
 _host_cooldown: dict = {}        # host -> time before which no link of that host is started
 _rl_tries: dict = {}             # (chat_id, url) -> tries so far
@@ -698,7 +698,6 @@ async def fast_upload(client, file_path, progress_callback=None):
                     except FloodWaitError as fe:
                         # a flood wait is a definite refusal: wait the full time asked, then send this part again
                         floods += 1
-                        if floods > _MAX_FLOOD_RETRIES: break
                         _user_flood_until[0] = max(_user_flood_until[0], time.time() + fe.seconds)
                         await asyncio.sleep(fe.seconds + 1)
                     except Exception:
@@ -2974,11 +2973,10 @@ async def _finish_upload(file_path: str, title: str, status_msg, uid: int, chat_
                 break
             except FloodWaitError as fe:
                 # definite refusal (nothing was accepted): hold the finished file, wait the full time, send again
-                floods += 1
-                if floods > _MAX_FLOOD_RETRIES: attempt = 5; continue
+                floods += 1   # no cap: every wait is the server's, it is waited out in full; Cancel stays available
                 _user_flood_until[0] = max(_user_flood_until[0], time.time() + fe.seconds)
                 for rem in range(fe.seconds + 1, 0, -5):
-                    await safe_edit(status_msg, f"⏳ *Telegram rate limit active:* upload paused, {rem}s left. Your file is kept and sends automatically; waiting links stay queued.", force=True)
+                    await safe_edit(status_msg, f"⏳ *Telegram rate limit active:* upload paused, {rem}s left{f' (wait {floods})' if floods > 1 else ''}. Your file is kept and sends automatically; waiting links stay queued.", force=True)
                     await asyncio.sleep(min(5, rem))
             except Exception as e:
                 attempt += 1
@@ -4218,8 +4216,8 @@ async def _next_link(uid: int, reply_msg):
             except Exception: pass
         await asyncio.sleep(min(30, max(1, soonest)))
 
-async def _say(msg, text: str):
-    try: await msg.reply_text(text)
+async def _say(msg, text: str, **kw):
+    try: await msg.reply_text(text, **kw)
     except Exception: pass
 
 async def _link_worker(uid: int, reply_msg):
@@ -4251,17 +4249,19 @@ async def _link_worker(uid: int, reply_msg):
                     tries = _rl_tries[key] = _rl_tries.get(key, 0) + 1
                     given = _rl_seen["after"] if _rl_seen["ts"] >= started else None
                     wait = given if given is not None else min(60 * 2 ** (tries - 1), 900)
-                    if given is not None and given > _RL_MAX_HOLD:
+                    _host_cooldown[host] = max(_host_cooldown.get(host, 0), time.time() + wait + 1)   # a server-stated wait is never shortened
+                    if tries >= _RL_MAX_TRIES:
+                        # repeated refusals: park the link instead of dropping it; /held resumes or clears it
                         _rl_tries.pop(key, None)
-                        await _say(reply_msg, f"⏸ {host} asked for a wait of {_fmt_wait(given)}. That is too long to hold the queue, so this link was not retried. Send it again later.")
-                    elif tries >= _RL_MAX_TRIES:
-                        _rl_tries.pop(key, None)
-                        await _say(reply_msg, f"⛔ {host} is still rate limiting (HTTP 429) after {tries} tries. This link was dropped; send it again later.")
+                        _held_links.setdefault(uid, []).append(url); requeued = True   # stays in pending_links (no duplicates)
+                        await _say(reply_msg, f"⏸ {host} is still rate limiting (HTTP 429) after {tries} tries. The link is held, not lost "
+                                              f"({len(_held_links[uid])} held). Use /held to resume it or clear it. "
+                                              f"{'The site asked for ' + _fmt_wait(given) + '; that wait is respected.' if given is not None else ''}".strip(),
+                                reply_markup=_held_kb())
                     else:
-                        _host_cooldown[host] = time.time() + wait + 1
                         q.put_nowait(url); requeued = True
                         await _say(reply_msg, f"⏸ {host} asked to slow down (HTTP 429). This link is retried in about {_fmt_wait(wait)} "
-                                                   f"(try {tries + 1} of {_RL_MAX_TRIES}); other sites continue meanwhile.")
+                                              f"(try {tries + 1} of {_RL_MAX_TRIES}); other sites continue meanwhile.")
             finally:
                 pend = pending_links.get(uid)
                 if not requeued and pend and url in pend: pend.remove(url)
@@ -4387,6 +4387,38 @@ def _cancel_chat(uid: int):
     task = dl_tasks.pop(uid, None)
     if task: task.cancel()
 
+def _resume_held(uid: int, reply_msg) -> int:
+    """Put held links back in the queue. A cooldown the site asked for is kept, so they wait it out first."""
+    links = _held_links.pop(uid, [])
+    if not links: return 0
+    q = link_queues.setdefault(uid, asyncio.Queue())
+    for x in links:
+        _rl_tries.pop((uid, x), None); q.put_nowait(x)
+    w = link_workers.get(uid)
+    if not w or w.done():
+        link_workers[uid] = asyncio.create_task(_link_worker(uid, reply_msg))
+    return len(links)
+
+def _held_text(uid: int) -> str:
+    links = _held_links.get(uid) or []
+    if not links: return "No held links."
+    hosts = collections.Counter(_link_host(x) for x in links)
+    now = time.time()
+    lines = [f"⏸ {len(links)} held link{'s' if len(links) != 1 else ''} (rate limited, kept in memory; a restart loses them):"]
+    for h, n in hosts.items():
+        cd = _host_cooldown.get(h, 0) - now
+        lines.append(f"• {h}: {n}" + (f" - the site asked to wait, about {_fmt_wait(cd)} left" if cd > 0 else ""))
+    return "\n".join(lines)
+
+def _held_kb():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("▶ Continue", callback_data="HELD|resume"),
+                                  InlineKeyboardButton("🗑 Clear held", callback_data="HELD|clear")]])
+
+async def held_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    uid = u.effective_chat.id
+    txt = _held_text(uid)
+    await u.message.reply_text(txt, reply_markup=_held_kb() if _held_links.get(uid) else None)
+
 async def cancelupload_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     """Upload-only command: acts only while this chat's job is in the upload step. Same effect as the inline Cancel
     button there (downloaded file kept, waiting links cleared); nothing happens at other steps."""
@@ -4403,6 +4435,25 @@ async def button_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     uid  = q.from_user.id
     data = q.data or ""
 
+    if data in ("HELD|resume", "HELD|clear"):
+        cid = q.message.chat_id
+        if data == "HELD|resume":
+            _hosts = {_link_host(x) for x in (_held_links.get(cid) or [])}
+            _left = max([_host_cooldown.get(h, 0) - time.time() for h in _hosts] or [0])
+            n = _resume_held(cid, q.message)
+            if not n: msg_ = "No held links."
+            elif _left > 0: msg_ = (f"▶ {n} held link{'s' if n != 1 else ''} back in the queue, but the site asked to wait: "
+                                    f"about {_fmt_wait(_left)} left. They start by themselves when it ends. Nothing to resend.")
+            else: msg_ = f"▶ {n} held link{'s' if n != 1 else ''} back in the queue and starting. Nothing to resend."
+        else:
+            links = _held_links.pop(cid, [])
+            pend = pending_links.get(cid) or []
+            for x in links:
+                if x in pend: pend.remove(x)
+            msg_ = f"🗑 {len(links)} held link{'s' if len(links) != 1 else ''} cleared." if links else "No held links."
+        try: await q.edit_message_text(msg_)
+        except Exception: pass
+        return
     if data == "ASKN|skip":
         pending_names.pop((q.message.chat_id, q.message.message_id), None)
         try: await q.edit_message_text("⏭ Skipped - name kept.")
@@ -4767,6 +4818,7 @@ async def main():
         BotCommand("stream", "Download a direct media/playlist URL"),
         BotCommand("kept", "Files kept after a failed upload: Retry / Delete"),
         BotCommand("cancelupload", "Cancel the upload that is running now"),
+        BotCommand("held", "Links held after repeated rate limits: resume or clear"),
         BotCommand("askname", "Ask for a video name after each upload: on / off"),
         BotCommand("pair", "Pair the browser extension (owner)"),
         BotCommand("unpair", "Revoke paired browsers (owner)"),
@@ -4801,6 +4853,7 @@ async def main():
     app.add_handler(CommandHandler("stream",    stream_cmd))
     app.add_handler(CommandHandler("kept",      kept_cmd))
     app.add_handler(CommandHandler("cancelupload", cancelupload_cmd))
+    app.add_handler(CommandHandler("held",      held_cmd))
     app.add_handler(CommandHandler("askname",   askname_cmd))
     app.add_handler(CommandHandler("pair",      pair_cmd))
     app.add_handler(CommandHandler("unpair",    unpair_cmd))

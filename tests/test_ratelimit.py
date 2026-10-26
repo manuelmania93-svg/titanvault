@@ -56,10 +56,11 @@ async def partB():
         ok(r and len(sends) == 1 and not os.path.exists(f), "two flood waits then success: exactly one send, file removed after the confirmed upload")
         ok(sum(1 for x in sleeps if x == 5) >= 6 and any("kept and sends automatically" in e for e in m.edits), "flood wait is shown and waited out (countdown), queue note included")
         ok(tv._user_flood_until[0] > time.time() + 40, "flood end time recorded for the worker")
-        # many floods: bounded, file kept, no send
-        sends.clear(); script[:] = [1] * 30; f = mkfile("f2.bin"); m = Msg(); tv._user_flood_until[0] = 0
+        # many floods in a row: still waited out, one send in the end, nothing churned into /kept
+        sends.clear(); script[:] = [1] * 30; f = mkfile("f2.bin"); m = Msg(); tv._user_flood_until[0] = 0; k0 = len(tv._kept_rows())
         r = await tv._finish_upload(f, "T2", m, 7, 7)
-        ok(not r and not sends and os.path.exists(f) and any("persistent" in e for e in m.edits), "more than the allowed flood waits: stops, file kept, nothing sent")
+        ok(r and len(sends) == 1 and not os.path.exists(f) and len(tv._kept_rows()) == k0, "30 flood waits in a row: every one waited out, exactly one send, no kept file")
+        ok(any("wait 30" in e for e in m.edits), "status shows how many waits so far")
     finally:
         tv.asyncio.sleep = real_sleep
     tv._user_flood_until[0] = 0
@@ -110,22 +111,56 @@ async def partD():
     ok(CALLS[2][1] - CALLS[0][1] >= 2.0, f"the server's Retry-After (2s) is waited out in full ({CALLS[2][1]-CALLS[0][1]:.1f}s)")
     ok(any("asked to slow down" in r and "try 2 of 3" in r for r in m.replies), "user told: slow down, retry time, try count")
     ok(tv.pending_links[7] == [] and not tv._rl_tries, "queue bookkeeping clean after success")
-    # bounded
-    reset()
+    # bounded: after 3 tries the link is HELD (not dropped)
+    reset(); tv._held_links.clear()
     async def always429(url, reply_msg, uid):
         CALLS.append((url, time.time())); tv._diag_reset(uid); tv._diag(uid, "HLS via yt-dlp", "playlist fetch", "HTTP 429")
         tv._rl_seen["ts"] = time.time(); tv._rl_seen["after"] = 1
     tv._do_dl = always429
     m = await start(["http://x.test/1"]); await asyncio.wait_for(tv.link_workers[7], 30)
-    ok(len(CALLS) == 3 and any("dropped" in r for r in m.replies), f"still limited: {len(CALLS)} tries, then dropped with a message")
-    # absurd wait is reported, never cut short and retried early
-    reset()
+    ok(len(CALLS) == 3 and tv._held_links.get(7) == ["http://x.test/1"] and any("held, not lost" in r and "/held" in r for r in m.replies), f"still limited: {len(CALLS)} tries, then the link is held (not dropped)")
+    ok(tv.pending_links[7] == ["http://x.test/1"], "held link still counts as pending (no duplicate adds)")
+    ok("x.test: 1" in tv._held_text(7), "/held text lists host and count, no URL path")
+    # the hold message itself carries a Continue button; clicking too early shows the remaining wait and does not shorten it
+    tv._host_cooldown["x.test"] = time.time() + 120
+    class Q2:
+        def __init__(s, d): s.data = d; s.from_user = types.SimpleNamespace(id=7); s.message = Msg(); s.message.chat_id = 7; s.message.message_id = 6; s.edits = []
+        async def answer(s, *a, **k): pass
+        async def edit_message_text(s, t, **k): s.edits.append(t)
+    kb = tv._held_kb(); ok(any(b.callback_data == "HELD|resume" and "Continue" in b.text for r in kb.inline_keyboard for b in r), "Continue button exists")
+    cd0 = tv._host_cooldown["x.test"]
+    async def noop(url, reply_msg, uid): CALLS.append((url, time.time())); tv._upload_count[uid] = tv._upload_count.get(uid, 0) + 1
+    tv._do_dl = noop; CALLS.clear()
+    q3 = Q2("HELD|resume"); await tv.button_handler(types.SimpleNamespace(callback_query=q3), None)
+    await asyncio.sleep(0.5)
+    ok("site asked to wait" in q3.edits[0] and "1m" in q3.edits[0] and "Nothing to resend" in q3.edits[0], f"Continue too early: remaining wait shown ({q3.edits[0][:90]})")
+    ok(not CALLS and tv._host_cooldown["x.test"] == cd0 and tv.link_queues[7].qsize() == 1, "cooldown not overridden: link queued, not started")
+    tv._cancel_chat(7); await asyncio.wait_for(tv.link_workers.get(7) or asyncio.sleep(0), 40)
+    tv._held_links[7] = ["http://x.test/1"]; tv.pending_links[7] = ["http://x.test/1"]; tv._host_cooldown.clear(); CALLS.clear()
+    # /held: resume puts it back (site wait respected), clear removes it
+    CALLS.clear(); state2 = {"n": 0}
+    async def okdl(url, reply_msg, uid): CALLS.append((url, time.time())); tv._upload_count[uid] = tv._upload_count.get(uid, 0) + 1
+    tv._do_dl = okdl; tv._host_cooldown.clear()
+    rm = Msg(); n = tv._resume_held(7, rm)
+    await asyncio.wait_for(tv.link_workers[7], 10)
+    ok(n == 1 and CALLS and not tv._held_links.get(7) and tv.pending_links[7] == [], "resume: held link goes back to the queue and runs")
+    reset(); tv._held_links[7] = ["http://x.test/9"]; tv.pending_links[7] = ["http://x.test/9"]
+    class Q:
+        def __init__(s, d): s.data = d; s.from_user = types.SimpleNamespace(id=7); s.message = Msg(); s.message.chat_id = 7; s.message.message_id = 5; s.edits = []
+        async def answer(s, *a, **k): pass
+        async def edit_message_text(s, t, **k): s.edits.append(t)
+    qq = Q("HELD|clear"); await tv.button_handler(types.SimpleNamespace(callback_query=qq), None)
+    ok(not tv._held_links.get(7) and tv.pending_links[7] == [] and "cleared" in qq.edits[0], "Clear held button removes it")
+    # a long server wait is never shortened or dropped: link stays queued under a long cooldown
+    reset(); tv._held_links.clear()
     async def huge(url, reply_msg, uid):
         CALLS.append((url, time.time())); tv._diag_reset(uid); tv._diag(uid, "HLS via yt-dlp", "playlist fetch", "HTTP 429")
         tv._rl_seen["ts"] = time.time(); tv._rl_seen["after"] = 10 * 3600
     tv._do_dl = huge
-    m = await start(["http://x.test/1"]); await asyncio.wait_for(tv.link_workers[7], 10)
-    ok(len(CALLS) == 1 and any("too long" in r for r in m.replies), "wait longer than 6h: reported, not retried early")
+    m = await start(["http://x.test/1"]); await asyncio.sleep(0.8)
+    ok(len(CALLS) == 1 and tv.link_queues[7].qsize() == 1 and tv._host_cooldown["x.test"] - time.time() > 9.9 * 3600 and not tv._held_links.get(7), "10h wait: link stays queued under the full cooldown, not dropped, not retried early")
+    ok(any("9h" in r or "10h" in r for r in m.replies), "user told the real wait")
+    tv._cancel_chat(7); await asyncio.wait_for(tv.link_workers.get(7) or asyncio.sleep(0), 40)
     # cancel while a link is cooling down
     reset(); state["n"] = 0
     async def dl429b(url, reply_msg, uid):
