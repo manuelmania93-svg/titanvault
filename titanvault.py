@@ -145,6 +145,7 @@ tgbot = TelegramClient(StringSession(), API_ID, API_HASH)
 
 _KEPT_SOURCES: set = set()   # sources kept because their upload was not confirmed
 pending_rename: dict = {}
+_uploading: set = set()    # chat ids whose job is in the upload step (Step 4/4) right now
 pending_names: dict = {}   # (chat_id, prompt_message_id) -> files.id awaiting an optional name (opt-in "ask for name")
 pending_thumb:  dict = {}
 pending_mp3:    dict = {}
@@ -2884,6 +2885,7 @@ async def _finish_upload(file_path: str, title: str, status_msg, uid: int, chat_
             duration, width, height = 0, 0, 0
 
         filesize = os.path.getsize(tmp)
+        _uploading.add(chat_id)
         await safe_edit(status_msg, f"☁️ *Step 4/4: Uploading {clean_title[:40]} ({fmt_size(filesize)})...*", force=True)
 
         async def ul_progress(current, total):
@@ -2971,6 +2973,7 @@ async def _finish_upload(file_path: str, title: str, status_msg, uid: int, chat_
         cancelled = True
         raise
     finally:
+        _uploading.discard(chat_id)
         _status_kb.pop(_msg_key(status_msg), None)
         # compressed / remuxed copies are always temporary
         if tmp and tmp != file_path and os.path.exists(tmp):
@@ -4251,6 +4254,28 @@ async def on_message(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await save_queues[uid].put({"update": u, "context": c, "name": name})
         return
 
+def _cancel_chat(uid: int):
+    """The Cancel button's action, shared with /cancelupload: stop the chat's active job and clear its waiting links."""
+    flag = dl_cancel_flags.get(uid)
+    if flag: flag[0] = True
+    q_links = link_queues.get(uid)
+    if q_links:
+        while not q_links.empty():
+            try: q_links.get_nowait()
+            except asyncio.QueueEmpty: break
+    if uid in pending_links: pending_links[uid].clear()
+    task = dl_tasks.pop(uid, None)
+    if task: task.cancel()
+
+async def cancelupload_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    """Upload-only command: acts only while this chat's job is in the upload step. Same effect as the inline Cancel
+    button there (downloaded file kept, waiting links cleared); nothing happens at other steps."""
+    cid = u.effective_chat.id
+    if cid not in _uploading:
+        return await u.message.reply_text("No upload is running right now, so there is nothing to cancel with this command.")
+    _cancel_chat(cid)
+    await u.message.reply_text("⛔ Cancelling the upload... The downloaded file is kept (see /kept), and waiting links are cleared like the Cancel button does.")
+
 async def button_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     q = u.callback_query
     try: await q.answer()
@@ -4292,17 +4317,7 @@ async def button_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
 
     if act == "PAGE": return await send_vault_page(q, int(tid), edit=True)
     if act == "DL_CANCEL":
-        uid = int(tid)
-        flag = dl_cancel_flags.get(uid)
-        if flag: flag[0] = True
-        q_links = link_queues.get(uid)
-        if q_links:
-            while not q_links.empty():
-                try: q_links.get_nowait()
-                except asyncio.QueueEmpty: break
-        if uid in pending_links: pending_links[uid].clear()
-        task = dl_tasks.pop(uid, None)
-        if task: task.cancel()
+        _cancel_chat(int(tid))
         return
 
     if act == "FILE":
@@ -4631,6 +4646,7 @@ async def main():
         BotCommand("dl", "Download video from URL"),
         BotCommand("stream", "Download a direct media/playlist URL"),
         BotCommand("kept", "Files kept after a failed upload: Retry / Delete"),
+        BotCommand("cancelupload", "Cancel the upload that is running now"),
         BotCommand("askname", "Ask for a video name after each upload: on / off"),
         BotCommand("pair", "Pair the browser extension (owner)"),
         BotCommand("unpair", "Revoke paired browsers (owner)"),
@@ -4664,6 +4680,7 @@ async def main():
     app.add_handler(CommandHandler(["dl", "snatch"], dl_cmd))
     app.add_handler(CommandHandler("stream",    stream_cmd))
     app.add_handler(CommandHandler("kept",      kept_cmd))
+    app.add_handler(CommandHandler("cancelupload", cancelupload_cmd))
     app.add_handler(CommandHandler("askname",   askname_cmd))
     app.add_handler(CommandHandler("pair",      pair_cmd))
     app.add_handler(CommandHandler("unpair",    unpair_cmd))
