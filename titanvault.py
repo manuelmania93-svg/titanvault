@@ -2698,6 +2698,26 @@ async def _do_dl_via_nm3u8dl(url: str, status_msg, cancel_flag: list, uid: int, 
         except Exception:
             pass
 
+_UNCERTAIN_SENDS: dict = {}   # kept file path -> final send was cancelled while in flight (outcome unknown)
+
+async def _find_in_storage(title: str, size: int, since: float):
+    """Look for our own just-sent upload in the storage channel (same caption, same size, recent).
+    Returns the message, False when the recent messages were read and it is not there, or None when the
+    check itself could not be made. 'Not there' is a snapshot, not proof the server never processed it."""
+    try:
+        msgs = await asyncio.wait_for(tgclient.get_messages(STORAGE_CHANNEL_ID, limit=20), 15)
+    except Exception:
+        return None
+    for m in msgs or []:
+        f = getattr(m, "file", None)
+        try:
+            when = m.date.timestamp()
+        except Exception:
+            when = 0
+        if f and (size is None or getattr(f, "size", None) == size) and (getattr(m, "message", "") or "") == title and when >= since - 120:
+            return m
+    return False
+
 async def _finish_upload(file_path: str, title: str, status_msg, uid: int, chat_id: int, skip_convert: bool = False) -> bool:
     loop  = asyncio.get_running_loop()
     t0    = time.time()
@@ -2709,6 +2729,7 @@ async def _finish_upload(file_path: str, title: str, status_msg, uid: int, chat_
     tmp   = file_path
     uploaded = False   # SAFETY: the original is only deleted after Telegram confirmed the upload
     cancelled = False  # the user pressed Cancel while this job was converting or uploading
+    send_state = None  # None | "notfound" | "unknown": the final send was cancelled in flight, outcome unconfirmed
     late_note = ""
     media_exts = (".mp4", ".mkv", ".webm", ".mov", ".avi", ".ts", ".flv", ".m4v",
                   ".mp3", ".m4a", ".aac", ".opus", ".ogg", ".wav", ".flac")
@@ -2772,6 +2793,7 @@ async def _finish_upload(file_path: str, title: str, status_msg, uid: int, chat_
 
         # Automatic FloodWait recovery loop (handles "SendMediaRequest" pauses)
         sent = None
+        send_since = time.time()
         for attempt in range(5):
             try:
                 send_task = asyncio.ensure_future(tgclient.send_file(
@@ -2789,10 +2811,18 @@ async def _finish_upload(file_path: str, title: str, status_msg, uid: int, chat_
                     # recalled: give it a short moment to settle, then record the real outcome.
                     try: sent = await asyncio.wait_for(asyncio.shield(send_task), _SEND_SETTLE_SECS)
                     except BaseException: sent = None
-                    if not sent:
+                    if sent:
+                        late_note = "\nℹ️ Cancel arrived after Telegram had already received the upload, so it completed."
+                    else:
                         send_task.cancel()
-                        raise asyncio.CancelledError()
-                    late_note = "\nℹ️ Cancel arrived after Telegram had already received the upload, so it completed."
+                        _cmp_size = filesize if tmp == file_path else None   # a converted copy's size differs from a later retry's
+                        found = await _find_in_storage(clean_title, _cmp_size, send_since)
+                        if found:
+                            sent = found
+                            late_note = "\nℹ️ Cancel arrived while the last step was in flight; the file is in the vault, so it completed."
+                        else:
+                            send_state = "unknown" if found is None else "notfound"
+                            raise asyncio.CancelledError()
                 break
             except FloodWaitError as fe:
                 _user_flood_until[0] = time.time() + fe.seconds
@@ -2850,6 +2880,11 @@ async def _finish_upload(file_path: str, title: str, status_msg, uid: int, chat_
                     _KEPT_SOURCES.add(file_path)
                     rid = _kept_register(file_path, clean_title, chat_id)
                     _lead = "⛔ Upload cancelled." if cancelled else "⚠️ Upload not confirmed."
+                    if send_state:
+                        _UNCERTAIN_SENDS[file_path] = {"title": clean_title, "size": filesize if tmp == file_path else None, "since": send_since, "warned": False}
+                        _lead += (" Telegram may already have received it and I could not check the vault; look there before pressing Retry."
+                                  if send_state == "unknown" else
+                                  " The last step was interrupted. The file was not found in the vault when I checked, but I cannot prove Telegram never processed it.")
                     await status_msg.reply_text(
                         f"{_lead} Your file is kept ({fmt_size(os.path.getsize(file_path))}): `{os.path.basename(file_path)[:50]}`",
                         parse_mode="Markdown", reply_markup=_kept_kb(rid))
@@ -4378,10 +4413,30 @@ async def kept_button(q, data: str) -> bool:
         return True
     _KEPT_SOURCES.discard(row[1])
     if act == "KEPT_DEL":
+        _UNCERTAIN_SENDS.pop(row[1], None)
         try: os.remove(row[1])
         except Exception: pass
         await q.edit_message_text("🗑 Deleted.")
         return True
+    _u = _UNCERTAIN_SENDS.get(row[1])
+    if _u:
+        found = await _find_in_storage(_u["title"], _u["size"], _u["since"])
+        if found:
+            with get_db() as conn:
+                conn.execute("INSERT INTO files (msg_id, name) VALUES (?,?)", (found.id, _u["title"])); conn.commit()
+            _UNCERTAIN_SENDS.pop(row[1], None)
+            try: os.remove(row[1])
+            except Exception: pass
+            await q.edit_message_text("✅ That upload had gone through before the cancel. It is in the vault; nothing was uploaded twice.")
+            return True
+        if found is None and not _u["warned"]:
+            _u["warned"] = True
+            _KEPT_SOURCES.add(row[1])
+            _rid2 = _kept_register(row[1], row[2], row[3])
+            await q.edit_message_text("⚠️ I could not check the vault. The earlier upload may have gone through. Press Retry again to upload anyway, or check the vault first.",
+                                      reply_markup=_kept_kb(_rid2))
+            return True
+        _UNCERTAIN_SENDS.pop(row[1], None)
     await q.edit_message_text("🔁 Retrying upload...")
     _cid = q.message.chat_id
     async def _retry():

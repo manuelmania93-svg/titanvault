@@ -32,7 +32,14 @@ class TL:
         if TL.mode=="hang": await asyncio.sleep(100)
         sent.append(1); return types.SimpleNamespace(id=len(sent))
     async def forward_messages(self,*a,**k): pass
+    recent=[]; fail=False
+    async def get_messages(self,*a,**k):
+        if TL.fail: raise ConnectionError("down")
+        return list(TL.recent)
 tv.tgclient = TL()
+def stored(title,size,id=900):
+    import datetime
+    return types.SimpleNamespace(id=id,message=title,file=types.SimpleNamespace(size=size),date=datetime.datetime.now(datetime.timezone.utc))
 
 async def run():
     tv._SEND_SETTLE_SECS = 1
@@ -95,8 +102,8 @@ async def run():
     ok(any("already received" in e for e in m3.edits), "user told the cancel came too late")
     ok(not os.path.exists(f3), "original removed after confirmed upload (existing rule)")
     ok(m3.kbs[-1] is None, "completed message has no Cancel button")
-    # 4. cancel while the send request never answers
-    TL.mode="hang"; sent.clear()
+    # 4. cancel while the send request never answers; vault shows nothing
+    TL.mode="hang"; sent.clear(); TL.recent=[]; TL.fail=False
     f4=mkfile("d.bin"); m4=Msg(); rows0=len(tv._kept_rows())
     t=asyncio.create_task(tv._finish_upload(f4,"D",m4,7,7)); tv.dl_tasks[7]=t
     await asyncio.sleep(0.4)
@@ -104,6 +111,38 @@ async def run():
     try: await t
     except asyncio.CancelledError: pass
     ok(t.cancelled() and os.path.exists(f4) and len(tv._kept_rows())==rows0+1, "unanswered send: cancelled, file kept")
+    txt=m4.replies[0][0]
+    ok("cannot prove" in txt and f4 in tv._UNCERTAIN_SENDS, "unconfirmed send is marked uncertain and the message says so")
+    # 4a. retry after 'not found': file lands later -> reconciled, no second upload
+    TL.mode="fast"; sent.clear(); TL.recent=[stored("D",os.path.getsize(f4))]
+    with tv.get_db() as c: n0=c.execute("SELECT count(*) FROM files").fetchone()[0]
+    rid=tv._kept_rows()[-1][0]; q=Q(7,"KEPT_RETRY|%d"%rid); await tv.kept_button(q,"KEPT_RETRY|%d"%rid); await asyncio.sleep(0.3)
+    with tv.get_db() as c: n1=c.execute("SELECT count(*) FROM files").fetchone()[0]
+    ok(not sent and n1==n0+1 and not os.path.exists(f4) and "nothing was uploaded twice" in q.edits[-1], "retry finds the earlier send in the vault: recorded, no duplicate upload")
+    # 4b. cancel; the send had actually gone through -> found right after cancel, completes
+    TL.mode="hang"; sent.clear(); f4b=mkfile("g.bin"); m4b=Msg(); TL.recent=[stored("G",os.path.getsize(f4b),901)]
+    t=asyncio.create_task(tv._finish_upload(f4b,"G",m4b,7,7)); tv.dl_tasks[7]=t
+    await asyncio.sleep(0.4)
+    await tv.button_handler(types.SimpleNamespace(callback_query=Q(7,"DL_CANCEL|7")), None)
+    try: res=await t
+    except asyncio.CancelledError: res="cancelled"
+    with tv.get_db() as c: ids=[r[0] for r in c.execute("SELECT msg_id FROM files")]
+    ok(res is True and 901 in ids and not os.path.exists(f4b) and any("in the vault" in e for e in m4b.edits), "in-flight send that had landed is found and recorded")
+    # 4c. vault cannot be read: unknown; first Retry warns and uploads nothing, second proceeds
+    TL.mode="hang"; TL.recent=[]; TL.fail=True; f4c=mkfile("h.bin"); m4c=Msg()
+    t=asyncio.create_task(tv._finish_upload(f4c,"H",m4c,7,7)); tv.dl_tasks[7]=t
+    await asyncio.sleep(0.4)
+    await tv.button_handler(types.SimpleNamespace(callback_query=Q(7,"DL_CANCEL|7")), None)
+    try: await t
+    except asyncio.CancelledError: pass
+    ok("could not check" in m4c.replies[0][0] and "before pressing Retry" in m4c.replies[0][0], "unreadable vault: user warned to check before Retry")
+    TL.mode="fast"; sent.clear()
+    tv.fast_upload=quick_upload
+    rid=tv._kept_rows()[-1][0]; q=Q(7,"KEPT_RETRY|%d"%rid); await tv.kept_button(q,"KEPT_RETRY|%d"%rid); await asyncio.sleep(0.3)
+    ok(not sent and os.path.exists(f4c) and "Press Retry again" in q.edits[-1], "first Retry with unverifiable state does not upload")
+    rid=tv._kept_rows()[-1][0]; q=Q(7,"KEPT_RETRY|%d"%rid); await tv.kept_button(q,"KEPT_RETRY|%d"%rid); await asyncio.sleep(0.5)
+    ok(len(sent)==1 and not os.path.exists(f4c), "second Retry uploads")
+    TL.fail=False
     # 5. normal completion: Cancel button disappears, nothing kept
     TL.mode="fast"; sent.clear(); f5=mkfile("e.bin"); m5=Msg(); rows0=len(tv._kept_rows())
     r=await tv._finish_upload(f5,"E",m5,7,7)
