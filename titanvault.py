@@ -134,6 +134,60 @@ pending_thumb:  dict = {}
 pending_mp3:    dict = {}
 dl_tasks:       dict = {}
 dl_cancel_flags: dict = {}
+link_queues:    dict = {}   # chat_id -> asyncio.Queue of pending page URLs (link worker consumes one at a time)
+link_workers:   dict = {}   # chat_id -> worker task
+pending_links:  dict = {}   # chat_id -> [urls active or queued] for duplicate detection
+LINK_RE = re.compile(r"https?://[^\s]+")
+
+# ── Download diagnostics (experimental): per-leg failure facts, shareable by the user ──
+dl_diag: dict = {}   # chat_id -> [(leg, stage, detail)]
+_TITANVAULT_DEBUG = os.environ.get("TITANVAULT_DEBUG", "").lower() in ("1", "true", "yes")
+
+def _diag_reset(uid):
+    dl_diag[uid] = []
+
+def _redact_url(url: str) -> str:
+    """Shareable form: scheme + host only - path and query may carry tokens."""
+    try:
+        p = urlparse(url or "")
+        return f"{p.scheme}://{p.netloc}/..." if p.scheme and p.netloc else "<url>"
+    except Exception:
+        return "<url>"
+
+def _http_status(err: str) -> str:
+    m = re.search(r"HTTP (?:error )?(?:response )?(?:code )?[:# ]*\[?(\d{3})", str(err), re.I)
+    return f"HTTP {m.group(1)}" if m else ""
+
+def _diag_detail(err) -> str:
+    """Fixed-vocabulary detail plus HTTP status. Raw exception text never reaches
+    diagnostics: it can embed the failing URL with its tokens."""
+    low = str(err).lower()
+    if "__cancelled__" in low: return "cancelled"
+    status = _http_status(err)
+    label = ("timeout" if "timed out" in low or "timeout" in low
+             else "connection error" if any(x in low for x in ("connection", "refused", "reset", "unreachable", "name or service"))
+             else "download error")
+    return status or label
+
+def _classify_hls_stage(err) -> str:
+    low = str(err).lower()
+    if any(x in low for x in ("fragment", "segment", ".ts", ".m4s")): return "segment fetch"
+    if ".m3u8" in low or "manifest" in low or "download webpage" in low: return "playlist fetch"
+    return "download"
+
+def _diag(uid, leg: str, stage: str, detail: str):
+    if uid not in dl_diag: return
+    dl_diag[uid].append((leg, stage, detail))
+    if _TITANVAULT_DEBUG:
+        logging.info(f"[diag] {leg} | {stage} | {detail}")
+
+def _diag_summary(uid) -> str:
+    entries = dl_diag.get(uid) or []
+    if not entries: return ""
+    lines = ["", "*Diagnostics (safe to share - no links or tokens):*"]
+    for leg, stage, detail in entries[-8:]:
+        lines.append(f"• {leg}: {stage} - {detail}")
+    return "\n".join(lines)
 save_queues:    dict = {}
 save_workers:   dict = {}
 user_thumbnails: dict = {}
@@ -1448,7 +1502,7 @@ def _scrape_real_url(url: str) -> tuple:
 # ══════════════════════════════════════════════════════
 #  ARIA2C & DIRECT FILE DOWNLOAD ENGINE
 # ══════════════════════════════════════════════════════
-async def _do_dl_via_aria2c(url: str, out_file: str, status_msg, cancel_flag: list, headers: dict = None) -> bool:
+async def _do_dl_via_aria2c(url: str, out_file: str, status_msg, cancel_flag: list, headers: dict = None, uid: int = None) -> bool:
     cmd = [
         ARIA2C_PATH,
         url,
@@ -1466,6 +1520,7 @@ async def _do_dl_via_aria2c(url: str, out_file: str, status_msg, cancel_flag: li
         for k, v in headers.items(): cmd.extend(["--header", f"{k}: {v}"])
 
     last_edit = [0.0]
+    last_err = [""]
     try:
         proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
         while proc.returncode is None:
@@ -1475,6 +1530,7 @@ async def _do_dl_via_aria2c(url: str, out_file: str, status_msg, cancel_flag: li
             line = await proc.stdout.readline()
             if not line: break
             line_str = line.decode(errors="replace")
+            if re.search(r"error|exception", line_str, re.I): last_err[0] = line_str.strip()[:300]
             m = re.search(r"\((\d+)%\).*?DL:([0-9.]+[A-Za-z]+).*?ETA:([0-9A-Za-z]+)", line_str)
             if m:
                 now = time.time()
@@ -1485,8 +1541,11 @@ async def _do_dl_via_aria2c(url: str, out_file: str, status_msg, cancel_flag: li
                     await safe_edit(status_msg, f"📥 *Downloading via aria2c...*\n\n[{bar}] {pct}%  •  {spd}/s  ETA {eta}")
             await asyncio.sleep(0.05)
         await proc.wait()
-        return os.path.exists(out_file) and os.path.getsize(out_file) > 0 and _probe_has_media_stream(out_file)
+        ok = os.path.exists(out_file) and os.path.getsize(out_file) > 0 and _probe_has_media_stream(out_file)
+        if not ok: _diag(uid, "direct via aria2c", "download", _diag_detail(last_err[0] or "no media in output"))
+        return ok
     except Exception as e:
+        _diag(uid, "direct via aria2c", "download", _diag_detail(e))
         logging.warning(f"aria2c error: {e}")
         return False
 
@@ -2077,11 +2136,13 @@ async def _do_dl_via_cffi(url: str, status_msg, cancel_flag: list, uid: int, cha
         result_file = await dl_task
         progress_task.cancel()
     except Exception as e:
-        await safe_edit(status_msg, f"❌ Download failed: {e}", force=True)
+        _diag(uid, "direct via curl", "download", _diag_detail(e))
+        await safe_edit(status_msg, f"❌ Download failed ({_diag_detail(e)}).", force=True)
         return False
 
     if cancel_flag[0] or not result_file or not os.path.exists(result_file):
         if os.path.exists(tmp_path): os.remove(tmp_path)
+        if not cancel_flag[0]: _diag(uid, "direct via curl", "output check", "no file saved")
         await safe_edit(status_msg, "❌ Cancelled or no file saved.", force=True)
         return False
 
@@ -2144,7 +2205,9 @@ async def _do_dl_via_ffmpeg_hls(url: str, status_msg, cancel_flag: list, uid: in
             await loop.run_in_executor(None, lambda r=active_ref: _run_ytdl_hls(r))
             if os.path.exists(ydl_out) and _probe_has_media_stream(ydl_out):
                 return await _finish_upload(ydl_out, _safe_title, status_msg, uid, chat_id)
-        except Exception:
+            _diag(uid, "HLS via yt-dlp", "output check", "no media stream in output")
+        except Exception as e:
+            _diag(uid, "HLS via yt-dlp", _classify_hls_stage(e), _diag_detail(e))
             if os.path.exists(ydl_out):
                 try: os.remove(ydl_out)
                 except: pass
@@ -2167,11 +2230,16 @@ async def _do_dl_via_ffmpeg_hls(url: str, status_msg, cancel_flag: list, uid: in
         ydl_out
     ]
     try:
-        proc = await asyncio.create_subprocess_exec(*ff_cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
-        await proc.wait()
+        proc = await asyncio.create_subprocess_exec(*ff_cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+        _, ff_err = await proc.communicate()
         if os.path.exists(ydl_out) and _probe_has_media_stream(ydl_out):
             return await _finish_upload(ydl_out, _safe_title, status_msg, uid, chat_id)
+        err_tail = (ff_err or b"").decode(errors="replace")[-2000:]
+        _diag(uid, "HLS via ffmpeg", _classify_hls_stage(err_tail), _diag_detail(err_tail))
+        if _TITANVAULT_DEBUG and err_tail:
+            logging.info(f"[diag] ffmpeg stderr tail: {err_tail[-400:]}")
     except Exception as e:
+        _diag(uid, "HLS via ffmpeg", "download", _diag_detail(e))
         logging.warning(f"[FFmpeg core error]: {e}")
 
     return False
@@ -2485,6 +2553,7 @@ async def _do_dl_via_jdownloader(url: str, status_msg, cancel_flag: list, uid: i
 async def _run_direct_stream(url: str, status, uid: int, chat_id: int, referer: str = "", title: str = ""):
     cancel_flag = [False]
     dl_cancel_flags[uid] = cancel_flag
+    _diag_reset(uid)
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"DL_CANCEL|{uid}")]])
     tmp_out = os.path.join(ARIA2C_DOWNLOAD_DIR, f"stream_{uid}_{int(time.time())}.mp4")
     clean_url = url.replace("&amp;", "&").strip()
@@ -2498,7 +2567,7 @@ async def _run_direct_stream(url: str, status, uid: int, chat_id: int, referer: 
             return
         hdrs = build_direct_headers(clean_url, ref or clean_url, _STANDARD_UA)
         await safe_edit(status, f"📥 *Direct media URL received*\n`{redact_url(clean_url)}`", reply_markup=kb, force=True)
-        ok = await _do_dl_via_aria2c(clean_url, tmp_out, status, cancel_flag, headers=hdrs)
+        ok = await _do_dl_via_aria2c(clean_url, tmp_out, status, cancel_flag, headers=hdrs, uid=uid)
         if cancel_flag[0]:
             await safe_edit(status, "⛔ Cancelled.", force=True)
             return
@@ -2513,7 +2582,8 @@ async def _run_direct_stream(url: str, status, uid: int, chat_id: int, referer: 
             await safe_edit(status, "⛔ Cancelled.", force=True)
         else:
             logging.error(f"Stream job error: {type(e).__name__}")
-            await safe_edit(status, f"❌ Error: {type(e).__name__}", force=True)
+            _diag(uid, "stream job", "download", _diag_detail(e))
+            await safe_edit(status, f"❌ Error: {type(e).__name__}" + _diag_summary(uid), force=True)
     finally:
         dl_tasks.pop(uid, None)
         dl_cancel_flags.pop(uid, None)
@@ -2555,6 +2625,7 @@ async def _do_dl(url: str, reply_msg, chat_id: int):
 
     cancel_flag = [False]
     dl_cancel_flags[uid] = cancel_flag
+    _diag_reset(uid)
     CANCEL_KB = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"DL_CANCEL|{uid}")]])
 
     def hook(d):
@@ -2597,6 +2668,7 @@ async def _do_dl(url: str, reply_msg, chat_id: int):
         if not real_url or real_url == url:
             snatch_res = await universal_snatch(url, status)
             if snatch_res and snatch_res.get("url"):
+                _diag(uid, "resolver", "detection", "stream candidate found")
                 real_url = snatch_res["url"]
                 scraped_title = snatch_res.get("title") or scraped_title
                 scraper_ref = snatch_res.get("headers", {}).get("Referer", url)
@@ -2642,6 +2714,7 @@ async def _do_dl(url: str, reply_msg, chat_id: int):
                 await loop.run_in_executor(None, run_ydl)
             except Exception as e:
                 if cancel_flag[0] or "__CANCELLED__" in str(e): raise
+                _diag(uid, "yt-dlp native", "page extract", _diag_detail(e))
                 if clean_target_url != url and detect_direct_video_ext(clean_target_url):
                     return await _do_dl_via_cffi(clean_target_url, status, cancel_flag, uid, chat_id, title=scraped_title, page_url=url)
                 return False
@@ -2654,7 +2727,8 @@ async def _do_dl(url: str, reply_msg, chat_id: int):
                 return True
             if await _do_dl_via_jdownloader(url, status, cancel_flag, uid, chat_id, title=scraped_title):
                 return True
-            await safe_edit(status, "❌ Could not download the detected stream (host error, expired link, or unsupported site).", force=True)
+            _diag(uid, "JDownloader", "-", "unavailable or failed")
+            await safe_edit(status, "❌ Could not download the detected stream (host error, expired link, or unsupported site)." + _diag_summary(uid), force=True)
             return False
 
         # 1. Direct HLS / DASH Stream routing
@@ -2681,7 +2755,7 @@ async def _do_dl(url: str, reply_msg, chat_id: int):
                     return
                 await _last_resorts()
                 return
-            ok = await _do_dl_via_aria2c(clean_target_url, tmp_out, status, cancel_flag, headers=direct_hdrs)
+            ok = await _do_dl_via_aria2c(clean_target_url, tmp_out, status, cancel_flag, headers=direct_hdrs, uid=uid)
             if ok and await _finish_upload(tmp_out, scraped_title or clean_name(os.path.basename(clean_target_url.rstrip("/"))), status, uid, chat_id):
                 return
             if await _do_dl_via_cffi(clean_target_url, status, cancel_flag, uid, chat_id, headers=direct_hdrs, title=scraped_title, page_url=ref_header):
@@ -2690,9 +2764,11 @@ async def _do_dl(url: str, reply_msg, chat_id: int):
             return
 
         if clean_target_url == url:
+            _diag(uid, "resolver", "detection", "no stream found")
             if await _do_dl_via_jdownloader(url, status, cancel_flag, uid, chat_id, title=scraped_title):
                 return
-            await safe_edit(status, "❌ Could not extract video stream from this URL (unsupported or protected site).", force=True)
+            _diag(uid, "JDownloader", "-", "unavailable or failed")
+            await safe_edit(status, "❌ Could not extract video stream from this URL (unsupported or protected site)." + _diag_summary(uid), force=True)
             return
 
         # Native yt-dlp core for standard platforms
@@ -2700,7 +2776,8 @@ async def _do_dl(url: str, reply_msg, chat_id: int):
             return
         if await _do_dl_via_jdownloader(url, status, cancel_flag, uid, chat_id, title=scraped_title):
             return
-        await safe_edit(status, "❌ Could not download video from this URL.", force=True)
+        _diag(uid, "JDownloader", "-", "unavailable or failed")
+        await safe_edit(status, "❌ Could not download video from this URL." + _diag_summary(uid), force=True)
         return
 
     except asyncio.CancelledError:
@@ -3389,6 +3466,31 @@ async def flush_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text("🗑 Thumbnail flushed!")
 
 
+async def _link_worker(uid: int, reply_msg):
+    """Sequentially downloads every URL in link_queues[uid]. One download at a
+    time per chat; a Cancel button press clears the queue in button_handler."""
+    q = link_queues[uid]
+    try:
+        while True:
+            try:
+                url = q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            task = asyncio.create_task(_do_dl(url, reply_msg, uid))
+            dl_tasks[uid] = task
+            try:
+                await task
+            except asyncio.CancelledError:
+                break   # DL_CANCEL cancels the active task and clears the queue
+            except Exception:
+                logging.exception(f"[link_worker] download failed: {url[:80]}")
+            finally:
+                pend = pending_links.get(uid)
+                if pend and url in pend: pend.remove(url)
+    finally:
+        link_workers.pop(uid, None)
+
+
 # ══════════════════════════════════════════════════════
 #  MESSAGE DISPATCHER & BUTTON HANDLER
 # ══════════════════════════════════════════════════════
@@ -3431,17 +3533,33 @@ async def on_message(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await _do_rename(c.bot, msg, data["db_id"], msg.text.strip(), echo_chat=u.effective_chat.id)
         return
 
-    if msg.text and re.match(r"https?://", msg.text.strip()) and not getattr(msg, "forward_origin", None):
-        uid = u.effective_chat.id
-        new_url = msg.text.strip()
-        if uid in dl_tasks and not dl_tasks[uid].done():
-            active_flag = dl_cancel_flags.get(uid)
-            if active_flag and len(active_flag) > 1 and active_flag[1] == new_url: return
-            dl_tasks[uid].cancel()
-            await asyncio.sleep(0.3)
-        task = asyncio.create_task(_do_dl(new_url, msg, uid))
-        dl_tasks[uid] = task
-        return
+    if msg.text and not getattr(msg, "forward_origin", None):
+        urls = [x.rstrip(".,;!?)>") for x in LINK_RE.findall(msg.text)]
+        if urls:
+            uid = u.effective_chat.id
+            pend = pending_links.setdefault(uid, [])
+            fresh = [x for x in urls if x not in pend]
+            dupes = len(urls) - len(fresh)
+            if fresh:
+                q = link_queues.setdefault(uid, asyncio.Queue())
+                for x in fresh:
+                    pend.append(x)
+                    await q.put(x)   # unbounded queue: put() never yields, worker cannot race the enqueue
+                w = link_workers.get(uid)
+                need_worker = not w or w.done()
+                if need_worker:
+                    link_workers[uid] = asyncio.create_task(_link_worker(uid, msg))
+                queued_n = len(fresh) - (1 if need_worker else 0)
+                notes = []
+                if queued_n > 0:
+                    notes.append(f"➕ {queued_n} link{'s' if queued_n != 1 else ''} queued - one download at a time.")
+                if dupes:
+                    notes.append(f"⏭️ {dupes} duplicate{'s' if dupes != 1 else ''} skipped (already downloading or queued).")
+                if notes:
+                    await msg.reply_text("\n".join(notes))
+            elif dupes:
+                await msg.reply_text("⏭️ Already downloading or queued - duplicate skipped.")
+            return
 
     if msg.video or (msg.document and getattr(msg.document, "mime_type", "").startswith("video/")):
         if uid in user_thumbnails and os.path.exists(user_thumbnails[uid]):
@@ -3506,6 +3624,12 @@ async def button_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
         uid = int(tid)
         flag = dl_cancel_flags.get(uid)
         if flag: flag[0] = True
+        q_links = link_queues.get(uid)
+        if q_links:
+            while not q_links.empty():
+                try: q_links.get_nowait()
+                except asyncio.QueueEmpty: break
+        if uid in pending_links: pending_links[uid].clear()
         task = dl_tasks.pop(uid, None)
         if task: task.cancel()
         return
