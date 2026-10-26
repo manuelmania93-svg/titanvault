@@ -252,6 +252,8 @@ def init_db():
         size     INTEGER,
         added_at TEXT DEFAULT (datetime('now'))
     )""")
+    try: c.execute("ALTER TABLE kept_jobs ADD COLUMN state TEXT DEFAULT ''")   # outcome-unknown marker, survives restarts
+    except sqlite3.OperationalError: pass
     conn.commit()
     conn.close()
 
@@ -269,10 +271,12 @@ def _inside_job_dir(path: str) -> bool:
     p = os.path.realpath(path)
     return p != root and os.path.commonpath([root, p]) == root
 
-def _kept_register(path: str, title: str, chat_id: int) -> int:
+def _kept_register(path: str, title: str, chat_id: int, state: str = "") -> int:
+    """state: "" for an ordinary failed upload; "unknown" / "notfound" / "candidate" when a cancelled final
+    send left it unclear whether Telegram already stored the file (see _finish_upload)."""
     with get_db() as conn:
-        cur = conn.execute("INSERT INTO kept_jobs (path, title, chat_id, size) VALUES (?,?,?,?)",
-                           (path, title, chat_id, os.path.getsize(path) if os.path.exists(path) else 0))
+        cur = conn.execute("INSERT INTO kept_jobs (path, title, chat_id, size, state) VALUES (?,?,?,?,?)",
+                           (path, title, chat_id, os.path.getsize(path) if os.path.exists(path) else 0, state))
         conn.commit()
         return cur.lastrowid
 
@@ -294,7 +298,15 @@ def _kept_blocked() -> bool:
     """Backpressure: new jobs are refused while kept files fill the cap. Nothing is auto-deleted."""
     return _kept_total() >= KEEP_CAP_BYTES
 
-def _kept_kb(row_id: int):
+def _kept_state(row_id: int) -> str:
+    with get_db() as conn:
+        r = conn.execute("SELECT state FROM kept_jobs WHERE id=?", (row_id,)).fetchone()
+    return (r[0] or "") if r else ""
+
+def _kept_kb(row_id: int, state: str = ""):
+    if state:   # outcome unknown: no plain Retry, only an explicit choice
+        return InlineKeyboardMarkup([[InlineKeyboardButton("⬆️ Upload anyway (may duplicate)", callback_data=f"KEPT_FORCE|{row_id}"),
+                                      InlineKeyboardButton("🗑 Delete", callback_data=f"KEPT_DEL|{row_id}")]])
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔁 Retry upload", callback_data=f"KEPT_RETRY|{row_id}"),
                                   InlineKeyboardButton("🗑 Delete", callback_data=f"KEPT_DEL|{row_id}")]])
 
@@ -2698,8 +2710,6 @@ async def _do_dl_via_nm3u8dl(url: str, status_msg, cancel_flag: list, uid: int, 
         except Exception:
             pass
 
-_UNCERTAIN_SENDS: dict = {}   # kept file path -> final send was cancelled while in flight (outcome unknown)
-
 async def _find_in_storage(title: str, size: int, since: float):
     """Look for our own just-sent upload in the storage channel (same caption, same size, recent).
     Returns the message, False when the recent messages were read and it is not there, or None when the
@@ -2817,12 +2827,9 @@ async def _finish_upload(file_path: str, title: str, status_msg, uid: int, chat_
                         send_task.cancel()
                         _cmp_size = filesize if tmp == file_path else None   # a converted copy's size differs from a later retry's
                         found = await _find_in_storage(clean_title, _cmp_size, send_since)
-                        if found:
-                            sent = found
-                            late_note = "\nℹ️ Cancel arrived while the last step was in flight; the file is in the vault, so it completed."
-                        else:
-                            send_state = "unknown" if found is None else "notfound"
-                            raise asyncio.CancelledError()
+                        # A caption/size match is a hint, never proof: nothing is recorded or deleted from it.
+                        send_state = "candidate" if found else ("unknown" if found is None else "notfound")
+                        raise asyncio.CancelledError()
                 break
             except FloodWaitError as fe:
                 _user_flood_until[0] = time.time() + fe.seconds
@@ -2878,16 +2885,17 @@ async def _finish_upload(file_path: str, title: str, status_msg, uid: int, chat_
             try:
                 if _inside_job_dir(file_path):
                     _KEPT_SOURCES.add(file_path)
-                    rid = _kept_register(file_path, clean_title, chat_id)
+                    rid = _kept_register(file_path, clean_title, chat_id, send_state or "")
                     _lead = "⛔ Upload cancelled." if cancelled else "⚠️ Upload not confirmed."
                     if send_state:
-                        _UNCERTAIN_SENDS[file_path] = {"title": clean_title, "size": filesize if tmp == file_path else None, "since": send_since, "warned": False}
-                        _lead += (" Telegram may already have received it and I could not check the vault; look there before pressing Retry."
-                                  if send_state == "unknown" else
-                                  " The last step was interrupted. The file was not found in the vault when I checked, but I cannot prove Telegram never processed it.")
+                        _lead += {
+                            "unknown": " The last step was interrupted and I could not check the vault: Telegram may already have this file.",
+                            "notfound": " The last step was interrupted. I did not find it in the vault when I checked, but I cannot prove Telegram never processed it.",
+                            "candidate": " The last step was interrupted. A message that looks like this file (same caption and size) is in the vault, but I cannot be sure it is this upload, so nothing was recorded and your file was not deleted.",
+                        }[send_state] + " Check the vault before choosing."
                     await status_msg.reply_text(
                         f"{_lead} Your file is kept ({fmt_size(os.path.getsize(file_path))}): `{os.path.basename(file_path)[:50]}`",
-                        parse_mode="Markdown", reply_markup=_kept_kb(rid))
+                        parse_mode="Markdown", reply_markup=_kept_kb(rid, send_state or ""))
             except Exception as _e:
                 logging.warning(f"Could not register kept file: {type(_e).__name__}")
     return uploaded
@@ -4399,44 +4407,34 @@ async def kept_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
         return await u.message.reply_text("No kept files. Nothing is waiting for a retry.")
     await u.message.reply_text(f"Kept: {fmt_size(_kept_total())} of {fmt_size(KEEP_CAP_BYTES)} limit")
     for rid, path, title, chat_id, size in rows:
-        await u.message.reply_text(f"{os.path.basename(path)[:50]} ({fmt_size(os.path.getsize(path))})", reply_markup=_kept_kb(rid))
+        await u.message.reply_text(f"{os.path.basename(path)[:50]} ({fmt_size(os.path.getsize(path))})", reply_markup=_kept_kb(rid, _kept_state(rid)))
 
 async def kept_button(q, data: str) -> bool:
-    """Handles KEPT_RETRY|id and KEPT_DEL|id. Only acts on files registered by a failed job inside the download folder."""
-    if not data.startswith(("KEPT_RETRY|", "KEPT_DEL|")): return False
+    """Handles KEPT_RETRY|id, KEPT_FORCE|id and KEPT_DEL|id. Only acts on files registered by a failed job
+    inside the download folder. A file whose last upload outcome is unknown (cancelled in flight) is never
+    retried by the plain Retry: only Delete or the explicit "Upload anyway"."""
+    if not data.startswith(("KEPT_RETRY|", "KEPT_FORCE|", "KEPT_DEL|")): return False
     act, rid = data.split("|", 1)
     with get_db() as conn:
-        row = conn.execute("SELECT id, path, title, chat_id FROM kept_jobs WHERE id=?", (int(rid),)).fetchone()
-        if row: conn.execute("DELETE FROM kept_jobs WHERE id=?", (row[0],)); conn.commit()
-    if not row or row[3] != q.message.chat_id or not os.path.exists(row[1]) or not _inside_job_dir(row[1]):
+        row = conn.execute("SELECT id, path, title, chat_id, state FROM kept_jobs WHERE id=?", (int(rid),)).fetchone()
+    valid = bool(row) and row[3] == q.message.chat_id and os.path.exists(row[1]) and _inside_job_dir(row[1])
+    if valid and act == "KEPT_RETRY" and row[4]:
+        await q.edit_message_text("⚠️ The earlier upload of this file may already be in the vault, so a plain retry could create a duplicate. "
+                                  "Check the vault: Delete this file if it is there, or choose Upload anyway.",
+                                  reply_markup=_kept_kb(row[0], row[4]))
+        return True
+    if row:
+        with get_db() as conn:
+            conn.execute("DELETE FROM kept_jobs WHERE id=?", (row[0],)); conn.commit()
+    if not valid:
         await q.edit_message_text("That file is no longer available.")
         return True
     _KEPT_SOURCES.discard(row[1])
     if act == "KEPT_DEL":
-        _UNCERTAIN_SENDS.pop(row[1], None)
         try: os.remove(row[1])
         except Exception: pass
         await q.edit_message_text("🗑 Deleted.")
         return True
-    _u = _UNCERTAIN_SENDS.get(row[1])
-    if _u:
-        found = await _find_in_storage(_u["title"], _u["size"], _u["since"])
-        if found:
-            with get_db() as conn:
-                conn.execute("INSERT INTO files (msg_id, name) VALUES (?,?)", (found.id, _u["title"])); conn.commit()
-            _UNCERTAIN_SENDS.pop(row[1], None)
-            try: os.remove(row[1])
-            except Exception: pass
-            await q.edit_message_text("✅ That upload had gone through before the cancel. It is in the vault; nothing was uploaded twice.")
-            return True
-        if found is None and not _u["warned"]:
-            _u["warned"] = True
-            _KEPT_SOURCES.add(row[1])
-            _rid2 = _kept_register(row[1], row[2], row[3])
-            await q.edit_message_text("⚠️ I could not check the vault. The earlier upload may have gone through. Press Retry again to upload anyway, or check the vault first.",
-                                      reply_markup=_kept_kb(_rid2))
-            return True
-        _UNCERTAIN_SENDS.pop(row[1], None)
     await q.edit_message_text("🔁 Retrying upload...")
     _cid = q.message.chat_id
     async def _retry():

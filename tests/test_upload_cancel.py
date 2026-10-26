@@ -102,47 +102,52 @@ async def run():
     ok(any("already received" in e for e in m3.edits), "user told the cancel came too late")
     ok(not os.path.exists(f3), "original removed after confirmed upload (existing rule)")
     ok(m3.kbs[-1] is None, "completed message has no Cancel button")
+    async def cancel_hung(name, title, recent=None, fail=False):
+        TL.mode="hang"; sent.clear(); TL.recent=recent if recent is not None else []; TL.fail=fail
+        f=mkfile(name); m=Msg()
+        t=asyncio.create_task(tv._finish_upload(f,title,m,7,7)); tv.dl_tasks[7]=t
+        await asyncio.sleep(0.4)
+        await tv.button_handler(types.SimpleNamespace(callback_query=Q(7,"DL_CANCEL|7")), None)
+        try: await t
+        except asyncio.CancelledError: pass
+        rid=[r[0] for r in tv._kept_rows() if r[1]==f][-1]
+        return f,m,rid,t
+    def vault_rows():
+        with tv.get_db() as c: return c.execute("SELECT count(*) FROM files").fetchone()[0]
+    def buttons(m): return [b.callback_data.split("|")[0] for r in m.replies[0][1]["reply_markup"].inline_keyboard for b in r]
     # 4. cancel while the send request never answers; vault shows nothing
-    TL.mode="hang"; sent.clear(); TL.recent=[]; TL.fail=False
-    f4=mkfile("d.bin"); m4=Msg(); rows0=len(tv._kept_rows())
-    t=asyncio.create_task(tv._finish_upload(f4,"D",m4,7,7)); tv.dl_tasks[7]=t
-    await asyncio.sleep(0.4)
-    await tv.button_handler(types.SimpleNamespace(callback_query=Q(7,"DL_CANCEL|7")), None)
-    try: await t
-    except asyncio.CancelledError: pass
-    ok(t.cancelled() and os.path.exists(f4) and len(tv._kept_rows())==rows0+1, "unanswered send: cancelled, file kept")
-    txt=m4.replies[0][0]
-    ok("cannot prove" in txt and f4 in tv._UNCERTAIN_SENDS, "unconfirmed send is marked uncertain and the message says so")
-    # 4a. retry after 'not found': file lands later -> reconciled, no second upload
-    TL.mode="fast"; sent.clear(); TL.recent=[stored("D",os.path.getsize(f4))]
-    with tv.get_db() as c: n0=c.execute("SELECT count(*) FROM files").fetchone()[0]
-    rid=tv._kept_rows()[-1][0]; q=Q(7,"KEPT_RETRY|%d"%rid); await tv.kept_button(q,"KEPT_RETRY|%d"%rid); await asyncio.sleep(0.3)
-    with tv.get_db() as c: n1=c.execute("SELECT count(*) FROM files").fetchone()[0]
-    ok(not sent and n1==n0+1 and not os.path.exists(f4) and "nothing was uploaded twice" in q.edits[-1], "retry finds the earlier send in the vault: recorded, no duplicate upload")
-    # 4b. cancel; the send had actually gone through -> found right after cancel, completes
-    TL.mode="hang"; sent.clear(); f4b=mkfile("g.bin"); m4b=Msg(); TL.recent=[stored("G",os.path.getsize(f4b),901)]
-    t=asyncio.create_task(tv._finish_upload(f4b,"G",m4b,7,7)); tv.dl_tasks[7]=t
-    await asyncio.sleep(0.4)
-    await tv.button_handler(types.SimpleNamespace(callback_query=Q(7,"DL_CANCEL|7")), None)
-    try: res=await t
-    except asyncio.CancelledError: res="cancelled"
-    with tv.get_db() as c: ids=[r[0] for r in c.execute("SELECT msg_id FROM files")]
-    ok(res is True and 901 in ids and not os.path.exists(f4b) and any("in the vault" in e for e in m4b.edits), "in-flight send that had landed is found and recorded")
-    # 4c. vault cannot be read: unknown; first Retry warns and uploads nothing, second proceeds
-    TL.mode="hang"; TL.recent=[]; TL.fail=True; f4c=mkfile("h.bin"); m4c=Msg()
-    t=asyncio.create_task(tv._finish_upload(f4c,"H",m4c,7,7)); tv.dl_tasks[7]=t
-    await asyncio.sleep(0.4)
-    await tv.button_handler(types.SimpleNamespace(callback_query=Q(7,"DL_CANCEL|7")), None)
-    try: await t
-    except asyncio.CancelledError: pass
-    ok("could not check" in m4c.replies[0][0] and "before pressing Retry" in m4c.replies[0][0], "unreadable vault: user warned to check before Retry")
+    n0=vault_rows(); f4,m4,rid4,t=await cancel_hung("d.bin","D")
+    ok(t.cancelled() and os.path.exists(f4), "unanswered send: cancelled, file kept")
+    ok(tv._kept_state(rid4)=="notfound" and "cannot prove" in m4.replies[0][0], "unconfirmed send is marked outcome-unknown (persisted in the database) and says so")
+    ok(buttons(m4)==["KEPT_FORCE","KEPT_DEL"], "buttons: Upload anyway / Delete, no plain Retry")
     TL.mode="fast"; sent.clear()
-    tv.fast_upload=quick_upload
-    rid=tv._kept_rows()[-1][0]; q=Q(7,"KEPT_RETRY|%d"%rid); await tv.kept_button(q,"KEPT_RETRY|%d"%rid); await asyncio.sleep(0.3)
-    ok(not sent and os.path.exists(f4c) and "Press Retry again" in q.edits[-1], "first Retry with unverifiable state does not upload")
-    rid=tv._kept_rows()[-1][0]; q=Q(7,"KEPT_RETRY|%d"%rid); await tv.kept_button(q,"KEPT_RETRY|%d"%rid); await asyncio.sleep(0.5)
-    ok(len(sent)==1 and not os.path.exists(f4c), "second Retry uploads")
-    TL.fail=False
+    q=Q(7,"KEPT_RETRY|%d"%rid4); await tv.kept_button(q,"KEPT_RETRY|%d"%rid4); await asyncio.sleep(0.3)
+    ok(not sent and os.path.exists(f4) and tv._kept_state(rid4)=="notfound" and "duplicate" in q.edits[-1], "a plain Retry press is refused, nothing uploaded, file and marker stay")
+    # 4a. a caption+size lookalike is a hint only: nothing recorded, nothing deleted
+    f4a,m4a,rid4a,t=await cancel_hung("g.bin","G",recent=[stored("G",os.path.getsize(mkfile("g_probe.bin")),901)])
+    ok(tv._kept_state(rid4a)=="candidate" and os.path.exists(f4a) and vault_rows()==n0, "lookalike message: marked candidate, not recorded, original not deleted")
+    ok("cannot be sure" in m4a.replies[0][0], "user told it is only a likely match")
+    # 4c. vault unreadable
+    f4c,m4c,rid4c,t=await cancel_hung("h.bin","H",fail=True)
+    ok(tv._kept_state(rid4c)=="unknown" and "could not check" in m4c.replies[0][0], "unreadable vault: marked unknown, user told")
+    # restart: all state lives in the database, nothing in memory
+    tv._KEPT_SOURCES.clear()
+    ok(tv._kept_state(rid4c)=="unknown" and tv._kept_state(rid4)=="notfound", "marker survives a restart (stored in kept_jobs)")
+    TL.mode="fast"; sent.clear(); tv.fast_upload=quick_upload
+    q=Q(7,"KEPT_RETRY|%d"%rid4c); await tv.kept_button(q,"KEPT_RETRY|%d"%rid4c)
+    ok(not sent and "duplicate" in q.edits[-1], "after restart a plain Retry is still refused")
+    q=Q(7,"KEPT_FORCE|%d"%rid4c); await tv.kept_button(q,"KEPT_FORCE|%d"%rid4c); await asyncio.sleep(0.5)
+    ok(len(sent)==1 and not os.path.exists(f4c), "explicit Upload anyway uploads, then removes the original after confirmation")
+    q=Q(7,"KEPT_DEL|%d"%rid4); await tv.kept_button(q,"KEPT_DEL|%d"%rid4)
+    ok(not os.path.exists(f4) and "Deleted" in q.edits[-1], "Delete works on an outcome-unknown file")
+    # migration: an old kept_jobs table without the column
+    import sqlite3
+    old=os.getcwd(); d=tempfile.mkdtemp(); os.chdir(d)
+    c=sqlite3.connect("vault.db"); c.execute("CREATE TABLE kept_jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT, title TEXT, chat_id INTEGER, size INTEGER, added_at TEXT DEFAULT (datetime('now')))")
+    c.execute("INSERT INTO kept_jobs (path,title,chat_id,size) VALUES ('p','t',7,1)"); c.commit(); c.close()
+    tv.init_db(); tv.init_db()
+    c=sqlite3.connect("vault.db"); st=c.execute("SELECT state FROM kept_jobs").fetchone()[0]; c.close(); os.chdir(old)
+    ok(st in ("",None), "old kept_jobs table is migrated; existing rows read as ordinary (and init_db is repeatable)")
     # 5. normal completion: Cancel button disappears, nothing kept
     TL.mode="fast"; sent.clear(); f5=mkfile("e.bin"); m5=Msg(); rows0=len(tv._kept_rows())
     r=await tv._finish_upload(f5,"E",m5,7,7)

@@ -22,7 +22,10 @@ class H(SimpleHTTPRequestHandler):
         if s.path.endswith(".ts"):
             CNT["seg"] += 1
             m = MODE["m"]
-            if (m in ("503", "429") and CNT["seg"] <= MODE["fails"]) or m == "403":
+            # fail the FIRST segment by name (the first-request rule was racy with concurrent fragments:
+            # a skipped middle segment leaves the container duration unchanged, so the control flaked)
+            CNT["first"] += s.path.endswith("index0.ts")
+            if (m in ("503", "429") and s.path.endswith("index0.ts") and CNT["first"] <= MODE["fails"]) or m == "403":
                 s.send_response(int(m)); s.send_header("Content-Length", "0"); s.end_headers(); return
         super().do_GET()
 srv = ThreadingHTTPServer(("127.0.0.1", 0), H); threading.Thread(target=srv.serve_forever, daemon=True).start()
