@@ -76,6 +76,30 @@ async def main():
     # 8. sniffer-captured User-Agent is used as is
     r, c = await run("block_desktop", extra={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Captured/1"})
     ok(not r and uas(c) == {"desktop"}, "captured browser User-Agent: no profile fallback")
+    # 8b. the real _do_dl entrypoint with sniffer-style headers: the sniffer always sends the bot's own desktop UA,
+    #     which must NOT count as a captured browser UA (fallback must still run)
+    tv.init_db(); tv._UA_PREF.clear(); MODE["m"] = "block_desktop"; LOG.clear(); del up[:]; tv._diag_reset(7)
+    _u = f"http://127.0.0.1:{PORT}/index.m3u8"
+    async def _snatch(url, status=None): return {"url": _u, "title": "t", "type": "hls", "headers": {"Referer": _u, "User-Agent": tv._STANDARD_UA}}
+    tv.universal_snatch = _snatch; tv._scrape_real_url = lambda url: (None, "", "")
+    await tv._do_dl(_u, FakeMsg(), 7)
+    c = collections.Counter(LOG)
+    ok(len(up) == 1 and c[("seg", "mobile")] >= 3, f"_do_dl with sniffer-style headers (bot's own UA): mobile fallback runs ({dict(c)})")
+    # 8c. an unexpected exception inside the flow is reported with its code location (no message text, no URL)
+    _orig = tv.safe_edit
+    async def _boom(msg, text, *a, **k):
+        if "Retrying stream via FFmpeg" in text: raise NameError("secret_token_xyz")   # outside any try in the chain
+        return await _orig(msg, text, *a, **k)
+    tv.safe_edit = _boom; MODE["m"] = "block_all"; del up[:]; tv._diag_reset(7)
+    class _Fin(FakeMsg):
+        pass
+    fm = _Fin(); await tv._do_dl(_u, fm, 7)
+    tv.safe_edit = _orig
+    _txt = " ".join(getattr(fm, "edits", []) or []) + " " + " ".join(getattr(x, "text", "") for x in getattr(fm, "sent", []))
+    _ents = tv.dl_diag.get(7, [])
+    ok(any(e[0] == "internal" and e[1] == "NameError" and "raised in" in e[2] for e in _ents) or "raised in" in _txt,
+       f"unexpected NameError is reported with function:line ({[e for e in _ents if e[0]=='internal']})")
+    ok("secret_token_xyz" not in _txt and not any("secret_token_xyz" in str(e) for e in _ents), "exception text never reaches diagnostics")
     # 9. a file that reached upload is never downloaded again
     tv._UA_PREF.clear()
     r, c = await run("open", finish_ok=False)

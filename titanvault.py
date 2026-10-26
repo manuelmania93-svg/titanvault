@@ -173,6 +173,19 @@ def _http_status(err: str) -> str:
     m = re.search(r"HTTP (?:error )?(?:response )?(?:code )?[:# ]*\[?(\d{3})", str(err), re.I)
     return f"HTTP {m.group(1)}" if m else ""
 
+def _exc_where(e) -> str:
+    """Where an unexpected exception was raised, as 'function:line' of the innermost frame in this file.
+    Code location only: no message text, so no URL or token can leak."""
+    try:
+        tb = e.__traceback__; here = os.path.abspath(__file__); where = ""
+        while tb is not None:
+            if os.path.abspath(tb.tb_frame.f_code.co_filename) == here:
+                where = f"{tb.tb_frame.f_code.co_name}:{tb.tb_lineno}"
+            tb = tb.tb_next
+        return where
+    except Exception:
+        return ""
+
 def _diag_detail(err) -> str:
     """Fixed-vocabulary detail plus HTTP status. Raw exception text never reaches
     diagnostics: it can embed the failing URL with its tokens."""
@@ -2462,7 +2475,8 @@ async def _do_dl_via_ffmpeg_hls(url: str, status_msg, cancel_flag: list, uid: in
     At most one extra pass; no cookies, no TLS or challenge handling; a file that reached upload is never redone.
     A User-Agent captured by the sniffer is a real browser request and is used as is (no fallback)."""
     kw = dict(page_url=page_url, title=title, referer=referer, extra_headers=extra_headers)
-    if any(str(k).lower() == "user-agent" for k in (extra_headers or {})):
+    # the sniffer's own context uses _STANDARD_UA, so that value is not a captured browser UA; only a different one is
+    if any(str(k).lower() == "user-agent" and str(v).strip() != _STANDARD_UA for k, v in (extra_headers or {}).items()):
         return await _hls_chain(url, status_msg, cancel_flag, uid, chat_id, **kw)
     host = urlparse(url.replace("&amp;", "&").strip()).netloc.lower()
     order = [("desktop", _STANDARD_UA), ("mobile", _MOBILE_UA)]
@@ -3396,6 +3410,8 @@ async def _do_dl(url: str, reply_msg, chat_id: int):
             await safe_final(status, "⛔ Cancelled.")
         else:
             logging.error(f"DL error: {e}", exc_info=True)
+            _w = _exc_where(e)
+            if _w: _diag(uid, "internal", type(e).__name__, f"raised in {_w}")
             await safe_final(status, f"❌ Error: {type(e).__name__} ({_diag_detail(e)})" + _diag_summary(uid))
     finally:
         dl_tasks.pop(uid, None)
