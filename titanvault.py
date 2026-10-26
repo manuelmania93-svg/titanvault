@@ -109,6 +109,10 @@ RETRY_BASE_DELAY  = 1.0
 RETRY_MAX_DELAY   = 30.0
 
 _STANDARD_UA   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+# Second request profile (Android Chrome, reduced UA format, same major version as the desktop one).
+# Used only as a bounded fallback after the server refuses the desktop profile (see _do_dl_via_ffmpeg_hls).
+_MOBILE_UA     = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+_UA_PREF: dict = {}   # host -> "mobile" | "desktop": the profile that last worked after a fallback (bounded)
 _STANDARD_LANG = "en-US,en;q=0.9"
 
 _SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
@@ -2325,7 +2329,14 @@ def _ff_looks_truncated(ff_err: str, out_path: str) -> bool:
     out = _probe_content_duration(out_path)
     return bool(out) and out < inp * 0.95 and (inp - out) > 1.5
 
-async def _do_dl_via_ffmpeg_hls(url: str, status_msg, cancel_flag: list, uid: int, chat_id: int, page_url: str = "", title: str = "", referer: str = "", extra_headers: dict = None) -> bool:
+async def _hls_chain(url: str, status_msg, cancel_flag: list, uid: int, chat_id: int, page_url: str = "", title: str = "", referer: str = "", extra_headers: dict = None,
+                     ua: str = "", state: dict = None, early_exit: bool = False, skip_ytdlp: bool = False) -> bool:
+    """One pass of the HLS/DASH legs (yt-dlp, FFmpeg, N_m3u8DL-RE) with ONE request profile (the User-Agent `ua`).
+    state flags: refused (a leg was refused with HTTP 403), reached (a file was handed to upload), early (stopped
+    after the first yt-dlp refusal so a fallback profile can be tried sooner). A User-Agent captured by the
+    sniffer (extra_headers) still wins over `ua`."""
+    ua = ua or _STANDARD_UA
+    state = state if state is not None else {}
     _canon = {"user-agent": "User-Agent", "referer": "Referer", "origin": "Origin",
               "accept": "Accept", "accept-language": "Accept-Language"}
     extra_headers = {_canon[str(k).lower()]: re.sub(r"[\r\n]", "", str(v)).strip()[:500]
@@ -2358,7 +2369,7 @@ async def _do_dl_via_ffmpeg_hls(url: str, status_msg, cancel_flag: list, uid: in
 
     def _run_ytdl_hls(ref_to_use):
         headers_dict = {
-            "User-Agent": _STANDARD_UA,
+            "User-Agent": ua,
             "Accept-Language": _STANDARD_LANG,
             "Referer": clean_referer(ref_to_use),
         }
@@ -2378,10 +2389,11 @@ async def _do_dl_via_ffmpeg_hls(url: str, status_msg, cancel_flag: list, uid: in
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([clean_url])
 
-    for active_ref in [_referer, base_referer]:
+    for active_ref in ([] if skip_ytdlp else [_referer, base_referer]):
         try:
             await loop.run_in_executor(None, lambda r=active_ref: _run_ytdl_hls(r))
             if os.path.exists(ydl_out) and _probe_has_media_stream(ydl_out):
+                state["reached"] = True
                 return await _finish_upload(ydl_out, _safe_title, status_msg, uid, chat_id)
             _diag(uid, "HLS via yt-dlp", "output check", "no media stream in output")
         except Exception as e:
@@ -2389,10 +2401,15 @@ async def _do_dl_via_ffmpeg_hls(url: str, status_msg, cancel_flag: list, uid: in
             if os.path.exists(ydl_out):
                 try: os.remove(ydl_out)
                 except: pass
+            if _http_status(e) == "HTTP 403":
+                state["refused"] = True
+                if early_exit:        # a fallback profile is available: try it now, the rest of this profile comes later
+                    state["early"] = True
+                    return False
 
     # FFmpeg fallback with stream repair & resilience flags
     await safe_edit(status_msg, "⚡ *Retrying stream via FFmpeg core...*", force=True)
-    header_str = f"User-Agent: {_STANDARD_UA}\r\nAccept-Language: {_STANDARD_LANG}\r\nReferer: {_referer}\r\n"
+    header_str = f"User-Agent: {ua}\r\nAccept-Language: {_STANDARD_LANG}\r\nReferer: {_referer}\r\n"
     for _hk, _hv in extra_headers.items():
         header_str += f"{_hk}: {_hv}\r\n"
     ff_cmd = [
@@ -2417,8 +2434,10 @@ async def _do_dl_via_ffmpeg_hls(url: str, status_msg, cancel_flag: list, uid: in
                 try: os.remove(ydl_out)
                 except Exception: pass
             else:
+                state["reached"] = True
                 return await _finish_upload(ydl_out, _safe_title, status_msg, uid, chat_id)
         err_tail = ff_text[-2000:]
+        if re.search(r"\b403\b", err_tail) and "forbidden" in err_tail.lower(): state["refused"] = True
         if not any(e[0] == "HLS via ffmpeg" and e[1] == "output check" and e[2].startswith("incomplete") for e in (dl_diag.get(uid) or [])):
             _diag(uid, "HLS via ffmpeg", _classify_hls_stage(err_tail), _diag_detail(err_tail))
         if _TITANVAULT_DEBUG and err_tail:
@@ -2429,9 +2448,43 @@ async def _do_dl_via_ffmpeg_hls(url: str, status_msg, cancel_flag: list, uid: in
 
     # Last HLS leg: external N_m3u8DL-RE (reports "disabled" / "not installed" itself)
     if True:
-        if await _do_dl_via_nm3u8dl(url, status_msg, cancel_flag, uid, chat_id, page_url=page_url, title=title, referer=referer, extra_headers=extra_headers):
+        if await _do_dl_via_nm3u8dl(url, status_msg, cancel_flag, uid, chat_id, page_url=page_url, title=title, referer=referer,
+                                    extra_headers=extra_headers, ua=ua, state=state):
             return True
 
+    return False
+
+async def _do_dl_via_ffmpeg_hls(url: str, status_msg, cancel_flag: list, uid: int, chat_id: int, page_url: str = "", title: str = "", referer: str = "", extra_headers: dict = None) -> bool:
+    """HLS/DASH with a bounded request-profile fallback. The desktop profile (the bot's usual User-Agent) goes first,
+    so working downloads behave exactly as before. Only when a leg was refused with HTTP 403, the other profile
+    (mobile User-Agent) is tried, carried through the playlist, segment and engine requests of that pass. The profile
+    that worked is remembered per host, so the next link from it starts there and the other one is the fallback.
+    At most one extra pass; no cookies, no TLS or challenge handling; a file that reached upload is never redone.
+    A User-Agent captured by the sniffer is a real browser request and is used as is (no fallback)."""
+    kw = dict(page_url=page_url, title=title, referer=referer, extra_headers=extra_headers)
+    if any(str(k).lower() == "user-agent" for k in (extra_headers or {})):
+        return await _hls_chain(url, status_msg, cancel_flag, uid, chat_id, **kw)
+    host = urlparse(url.replace("&amp;", "&").strip()).netloc.lower()
+    order = [("desktop", _STANDARD_UA), ("mobile", _MOBILE_UA)]
+    if _UA_PREF.get(host) == "mobile": order.reverse()
+    first, second = order
+    st1 = {}
+    if await _hls_chain(url, status_msg, cancel_flag, uid, chat_id, ua=first[1], state=st1, early_exit=True, **kw):
+        return True
+    if cancel_flag[0] or st1.get("reached") or not st1.get("refused"):
+        return False
+    _diag(uid, "Request profile", second[0], f"retrying after the {first[0]} profile was refused (HTTP 403)")
+    await safe_edit(status_msg, f"🔁 *Retrying with a {second[0]} browser profile...*", force=True)
+    st2 = {}
+    if await _hls_chain(url, status_msg, cancel_flag, uid, chat_id, ua=second[1], state=st2, **kw):
+        if len(_UA_PREF) > 200: _UA_PREF.clear()
+        _UA_PREF[host] = second[0]
+        return True
+    if cancel_flag[0] or st2.get("reached"):
+        return False
+    if st1.get("early"):   # the first profile stopped after its first refusal: run its remaining legs too
+        _diag(uid, "Request profile", first[0], "remaining engines of the first profile")
+        return await _hls_chain(url, status_msg, cancel_flag, uid, chat_id, ua=first[1], state={}, skip_ytdlp=True, **kw)
     return False
 
 # ══════════════════════════════════════════════════════
@@ -2608,13 +2661,14 @@ async def _nm_exec(binary: str, args: list, cwd: str, cancel_flag: list, on_chun
         if not rtask.done(): rtask.cancel()
 
 async def _do_dl_via_nm3u8dl(url: str, status_msg, cancel_flag: list, uid: int, chat_id: int, page_url: str = "",
-                             title: str = "", referer: str = "", extra_headers: dict = None) -> bool:
+                             title: str = "", referer: str = "", extra_headers: dict = None, ua: str = "", state: dict = None) -> bool:
     """HLS/DASH via the external N_m3u8DL-RE binary, in two runs of the exe itself:
     1) probe (--skip-download --write-meta-json): the exe fetches the manifest with our headers, we read the
        variant sizes from its meta.json and apply the 1080p policy; no request is made by the bot itself.
     2) download with the chosen variant pinned. Output is validated with ffprobe and handed to _finish_upload.
     Returns False (with a fixed-vocabulary diagnostic) on any failure."""
     leg = "HLS via N_m3u8DL-RE"
+    state = state if state is not None else {}
     if N_M3U8DL_MODE == "off":
         _diag(uid, leg, "disabled", "N_M3U8DL_MODE=off")
         return False
@@ -2626,7 +2680,7 @@ async def _do_dl_via_nm3u8dl(url: str, status_msg, cancel_flag: list, uid: int, 
               "accept": "Accept", "accept-language": "Accept-Language"}
     clean_url = url.replace("&amp;", "&").replace("\\", "").strip()
     _ref = clean_referer(referer or page_url or clean_url)
-    headers = {"User-Agent": _STANDARD_UA, "Accept-Language": _STANDARD_LANG, "Referer": _ref}
+    headers = {"User-Agent": ua or _STANDARD_UA, "Accept-Language": _STANDARD_LANG, "Referer": _ref}
     headers.update({_canon[str(k).lower()]: str(v)[:500] for k, v in (extra_headers or {}).items()
                     if str(k).lower() in _canon})
     _safe_title = re.sub(r'[\\/*?:"<>|]', "", title).strip() or f"video_{uid}"
@@ -2652,6 +2706,7 @@ async def _do_dl_via_nm3u8dl(url: str, status_msg, cancel_flag: list, uid: int, 
             if timed_out:
                 _diag(uid, leg, "probe failed", "timeout (exe request)")
             else:
+                if rc == _NM_STOPPED_EARLY: state["refused"] = True
                 stage, detail = _nm_classify(tail, False)
                 _diag(uid, leg, "probe failed", f"{stage} - {detail} (exe request)" + (" (stopped after the request was refused twice)" if rc == _NM_STOPPED_EARLY else f" (exit code {rc})" if rc not in (0, None) else ""))
             return False
@@ -2695,6 +2750,7 @@ async def _do_dl_via_nm3u8dl(url: str, status_msg, cancel_flag: list, uid: int, 
             elif rc is not None: detail = f"{detail} (exit code {rc})"
             _diag(uid, leg, stage, detail)
             return False
+        state["reached"] = True
         return await _finish_upload(max(good, key=os.path.getsize), _safe_title, status_msg, uid, chat_id)
     except asyncio.CancelledError:
         raise
