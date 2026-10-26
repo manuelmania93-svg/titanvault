@@ -188,12 +188,40 @@ def _exc_where(e) -> str:
     except Exception:
         return ""
 
+def _retry_after_from(err):
+    """Seconds from a Retry-After header found on the exception (or its causes), or None."""
+    import email.utils
+    seen, stack = set(), [err]
+    while stack:
+        e = stack.pop()
+        if e is None or id(e) in seen: continue
+        seen.add(id(e))
+        for holder in (getattr(e, "response", None), e):
+            h = getattr(holder, "headers", None)
+            try: v = h.get("Retry-After") if h is not None else None
+            except Exception: v = None
+            if v:
+                v = str(v).strip()
+                if v.isdigit(): return int(v)
+                try:
+                    dt = email.utils.parsedate_to_datetime(v)
+                    return max(0, int(dt.timestamp() - time.time()))
+                except Exception: pass
+        stack += [getattr(e, "__cause__", None), getattr(e, "__context__", None)]
+        ei = getattr(e, "exc_info", None)
+        if ei and len(ei) > 1: stack.append(ei[1])
+    return None
+
 def _diag_detail(err) -> str:
     """Fixed-vocabulary detail plus HTTP status. Raw exception text never reaches
     diagnostics: it can embed the failing URL with its tokens."""
     low = str(err).lower()
     if "__cancelled__" in low: return "cancelled"
     status = _http_status(err)
+    if status == "HTTP 429":
+        ra = _retry_after_from(err)
+        _rl_seen["ts"] = time.time()
+        if ra is not None: _rl_seen["after"] = max(ra, _rl_seen["after"] or 0)
     label = ("timeout" if "timed out" in low or "timeout" in low
              else "connection error" if any(x in low for x in ("connection", "refused", "reset", "unreachable", "name or service"))
              else "download error")
@@ -240,6 +268,13 @@ retry_counts: dict = {}
 
 _last_edit_times = {}
 _flood_wait_until = [0.0]
+_MAX_FLOOD_RETRIES = 20          # Telegram flood waits per send; each one is waited out in full
+_RL_MAX_TRIES = 3                # tries per link when the source says "slow down" (HTTP 429)
+_RL_MAX_HOLD = 6 * 3600          # a source asking for a longer wait than this is reported, not retried early
+_upload_count: dict = {}         # chat_id -> number of confirmed uploads (to tell success from failure)
+_host_cooldown: dict = {}        # host -> time before which no link of that host is started
+_rl_tries: dict = {}             # (chat_id, url) -> tries so far
+_rl_seen = {"ts": 0.0, "after": None}   # latest HTTP 429 seen by any leg, with the server's Retry-After seconds if given
 _user_flood_until = [0.0]
 
 VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".avi", ".mov", ".ts", ".m4v", ".flv", ".m4s")
@@ -654,14 +689,20 @@ async def fast_upload(client, file_path, progress_callback=None):
                        SaveFilePartRequest(file_id, part_idx, chunk))
 
                 success = False
-                for attempt in range(3):
+                attempts = floods = 0
+                while attempts < 3:
                     try:
                         await client(req)
                         success = True
                         break
                     except FloodWaitError as fe:
-                        await asyncio.sleep(fe.seconds)
+                        # a flood wait is a definite refusal: wait the full time asked, then send this part again
+                        floods += 1
+                        if floods > _MAX_FLOOD_RETRIES: break
+                        _user_flood_until[0] = max(_user_flood_until[0], time.time() + fe.seconds)
+                        await asyncio.sleep(fe.seconds + 1)
                     except Exception:
+                        attempts += 1
                         await asyncio.sleep(0.5)
 
                 if not success:
@@ -2903,7 +2944,8 @@ async def _finish_upload(file_path: str, title: str, status_msg, uid: int, chat_
         # Automatic FloodWait recovery loop (handles "SendMediaRequest" pauses)
         sent = None
         send_since = time.time()
-        for attempt in range(5):
+        attempt = floods = 0
+        while attempt < 5:
             try:
                 send_task = asyncio.ensure_future(tgclient.send_file(
                     STORAGE_CHANNEL_ID,
@@ -2931,11 +2973,15 @@ async def _finish_upload(file_path: str, title: str, status_msg, uid: int, chat_
                         raise asyncio.CancelledError()
                 break
             except FloodWaitError as fe:
-                _user_flood_until[0] = time.time() + fe.seconds
-                for rem in range(fe.seconds, 0, -5):
-                    await safe_edit(status_msg, f"⏳ *Telegram rate limit active:* Pausing upload for {rem}s...", force=True)
+                # definite refusal (nothing was accepted): hold the finished file, wait the full time, send again
+                floods += 1
+                if floods > _MAX_FLOOD_RETRIES: attempt = 5; continue
+                _user_flood_until[0] = max(_user_flood_until[0], time.time() + fe.seconds)
+                for rem in range(fe.seconds + 1, 0, -5):
+                    await safe_edit(status_msg, f"⏳ *Telegram rate limit active:* upload paused, {rem}s left. Your file is kept and sends automatically; waiting links stay queued.", force=True)
                     await asyncio.sleep(min(5, rem))
             except Exception as e:
+                attempt += 1
                 logging.error(f"Upload error attempt {attempt}: {e}")
                 await asyncio.sleep(2)
 
@@ -2950,6 +2996,7 @@ async def _finish_upload(file_path: str, title: str, status_msg, uid: int, chat_
             conn.commit()
 
         uploaded = True
+        _upload_count[chat_id] = _upload_count.get(chat_id, 0) + 1
         _status_kb.pop(_msg_key(status_msg), None)
         await safe_edit(status_msg, f"✅ *Completed!*\n*{clean_title[:60]}*\n💾 {fmt_size(filesize)}{late_note}", force=True)
 
@@ -4124,16 +4171,70 @@ async def flush_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     await u.message.reply_text("🗑 Thumbnail flushed!")
 
 
+def _link_host(url: str) -> str:
+    try: return urlparse(url).netloc.lower()
+    except Exception: return ""
+
+def _fmt_wait(sec: float) -> str:
+    sec = int(max(0, sec)); h, r = divmod(sec, 3600); m, s2 = divmod(r, 60)
+    return (f"{h}h " if h else "") + (f"{m}m " if m or h else "") + f"{s2}s"
+
+async def _wait_flood_clear(uid: int, reply_msg):
+    """Do not start the next download while Telegram's upload flood wait is active (the finished file would only
+    be refused again). Waits the full time; Cancel still works because the queue is cleared and the loop ends."""
+    left = _user_flood_until[0] - time.time()
+    if left <= 0: return
+    q = link_queues.get(uid)
+    try:
+        await reply_msg.reply_text(f"⏸ Telegram upload limit active. Next download starts in about {_fmt_wait(left)} "
+                                   f"({q.qsize() if q else 0} waiting). Nothing is lost.")
+    except Exception: pass
+    while _user_flood_until[0] - time.time() > 0:
+        await asyncio.sleep(min(30, max(1, _user_flood_until[0] - time.time())))
+        q = link_queues.get(uid)
+        if q is None or q.empty(): return
+
+async def _next_link(uid: int, reply_msg):
+    """Pick the next waiting link whose host is not cooling down after an HTTP 429. Returns None when the queue is
+    empty. If every waiting link is cooling down, waits (the links stay in the queue, so Cancel still clears them)."""
+    q = link_queues[uid]; noted = False
+    while True:
+        items = []
+        while True:
+            try: items.append(q.get_nowait())
+            except asyncio.QueueEmpty: break
+        if not items: return None
+        now = time.time()
+        pick = next((x for x in items if _host_cooldown.get(_link_host(x), 0) <= now), None)
+        if pick is not None:
+            items.remove(pick)
+            for x in items: q.put_nowait(x)
+            return pick
+        for x in items: q.put_nowait(x)
+        soonest = min(_host_cooldown.get(_link_host(x), 0) for x in items) - now
+        if not noted:
+            noted = True
+            try: await reply_msg.reply_text(f"⏸ The sites asked to slow down. Waiting links resume in about {_fmt_wait(soonest)}. Nothing is lost.")
+            except Exception: pass
+        await asyncio.sleep(min(30, max(1, soonest)))
+
+async def _say(msg, text: str):
+    try: await msg.reply_text(text)
+    except Exception: pass
+
 async def _link_worker(uid: int, reply_msg):
     """Sequentially downloads every URL in link_queues[uid]. One download at a
-    time per chat; a Cancel button press clears the queue in button_handler."""
+    time per chat; a Cancel button press clears the queue in button_handler.
+    Rate limits: Telegram's upload flood wait pauses the whole queue; a source's HTTP 429 puts that source's
+    links on cooldown (the server's Retry-After is waited out in full) and the link is retried, bounded."""
     q = link_queues[uid]
     try:
         while True:
-            try:
-                url = q.get_nowait()
-            except asyncio.QueueEmpty:
-                break
+            await _wait_flood_clear(uid, reply_msg)
+            url = await _next_link(uid, reply_msg)
+            if url is None: break
+            before = _upload_count.get(uid, 0); started = time.time(); _rl_seen["after"] = None
+            requeued = False
             task = asyncio.create_task(_do_dl(url, reply_msg, uid))
             dl_tasks[uid] = task
             try:
@@ -4142,9 +4243,28 @@ async def _link_worker(uid: int, reply_msg):
                 break   # DL_CANCEL cancels the active task and clears the queue
             except Exception:
                 logging.exception(f"[link_worker] download failed: {url[:80]}")
+            else:
+                if _upload_count.get(uid, 0) > before: _rl_tries.pop((uid, url), None)
+                if (_upload_count.get(uid, 0) == before
+                        and any(e[2] == "HTTP 429" for e in (dl_diag.get(uid) or []))):
+                    host = _link_host(url); key = (uid, url)
+                    tries = _rl_tries[key] = _rl_tries.get(key, 0) + 1
+                    given = _rl_seen["after"] if _rl_seen["ts"] >= started else None
+                    wait = given if given is not None else min(60 * 2 ** (tries - 1), 900)
+                    if given is not None and given > _RL_MAX_HOLD:
+                        _rl_tries.pop(key, None)
+                        await _say(reply_msg, f"⏸ {host} asked for a wait of {_fmt_wait(given)}. That is too long to hold the queue, so this link was not retried. Send it again later.")
+                    elif tries >= _RL_MAX_TRIES:
+                        _rl_tries.pop(key, None)
+                        await _say(reply_msg, f"⛔ {host} is still rate limiting (HTTP 429) after {tries} tries. This link was dropped; send it again later.")
+                    else:
+                        _host_cooldown[host] = time.time() + wait + 1
+                        q.put_nowait(url); requeued = True
+                        await _say(reply_msg, f"⏸ {host} asked to slow down (HTTP 429). This link is retried in about {_fmt_wait(wait)} "
+                                                   f"(try {tries + 1} of {_RL_MAX_TRIES}); other sites continue meanwhile.")
             finally:
                 pend = pending_links.get(uid)
-                if pend and url in pend: pend.remove(url)
+                if not requeued and pend and url in pend: pend.remove(url)
     finally:
         link_workers.pop(uid, None)
 
