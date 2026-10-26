@@ -64,6 +64,15 @@ async def main():
     EVENTS[B].set(); await finish_worker()
     ok(DONE == [A, B], "multi-URL message: both completed in order")
 
+    # 1b. queue feedback: the note states how many are waiting in total (active one counted separately)
+    reset()
+    await send(f"{A} {B} {C}")
+    ok(any("2 links queued" in r and "Waiting now: 2" in r and "plus 1 downloading" in r for r in REPLIES), "3 links at once: 2 waiting reported")
+    REPLIES.clear(); await send("https://site-d.test/v/4")
+    ok(any("1 link queued" in r and "Waiting now: 3" in r for r in REPLIES), "one more while active: total waiting is 3, not just 1")
+    for u in (A, B, C): EVENTS.setdefault(u, asyncio.Event()).set()
+    EVENTS.setdefault("https://site-d.test/v/4", asyncio.Event()).set(); await finish_worker()
+
     # 2. second message while active: queued, first NOT cancelled
     reset()
     await send(A)

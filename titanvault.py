@@ -145,6 +145,7 @@ tgbot = TelegramClient(StringSession(), API_ID, API_HASH)
 
 _KEPT_SOURCES: set = set()   # sources kept because their upload was not confirmed
 pending_rename: dict = {}
+pending_names: dict = {}   # (chat_id, prompt_message_id) -> files.id awaiting an optional name (opt-in "ask for name")
 pending_thumb:  dict = {}
 pending_mp3:    dict = {}
 dl_tasks:       dict = {}
@@ -269,6 +270,7 @@ def init_db():
         size     INTEGER,
         added_at TEXT DEFAULT (datetime('now'))
     )""")
+    c.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
     try: c.execute("ALTER TABLE kept_jobs ADD COLUMN state TEXT DEFAULT ''")   # outcome-unknown marker, survives restarts
     except sqlite3.OperationalError: pass
     conn.commit()
@@ -276,6 +278,31 @@ def init_db():
 
 def get_db():
     return sqlite3.connect("vault.db")
+
+def _ask_name_on(chat_id: int) -> bool:
+    """Opt-in per chat, off by default. Off = no naming question, behaviour unchanged."""
+    try:
+        with get_db() as conn:
+            row = conn.execute("SELECT value FROM settings WHERE key=?", (f"askname:{chat_id}",)).fetchone()
+        return bool(row and row[0] == "1")
+    except Exception:
+        return False
+
+def _ask_name_set(chat_id: int, on: bool):
+    with get_db() as conn:
+        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (f"askname:{chat_id}", "1" if on else "0"))
+        conn.commit()
+
+async def _ask_name_prompt(bot, chat_id: int, db_id: int, title: str):
+    """After a delivered upload (only when the toggle is on): ask for a visible name. Never blocks the queue;
+    a reply to this message renames, Skip or silence keeps the current name."""
+    try:
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏭ Skip (keep name)", callback_data="ASKN|skip")]])
+        m = await bot.send_message(chat_id, f"✏️ Name for this video?\nReply to this message with the name, or tap Skip.\nCurrent: {title[:80]}", reply_markup=kb)
+        if len(pending_names) > 200: pending_names.pop(next(iter(pending_names)))
+        pending_names[(chat_id, m.message_id)] = db_id
+    except Exception as e:
+        logging.warning(f"Ask-for-name prompt failed: {type(e).__name__}")
 
 def is_owner(uid: int) -> bool:
     return uid == OWNER_ID
@@ -2917,6 +2944,7 @@ async def _finish_upload(file_path: str, title: str, status_msg, uid: int, chat_
         with get_db() as conn:
             cur = conn.cursor()
             cur.execute("INSERT INTO files (msg_id, name) VALUES (?,?)", (sent.id, clean_title))
+            _new_file_id = cur.lastrowid
             conn.commit()
 
         uploaded = True
@@ -2937,6 +2965,8 @@ async def _finish_upload(file_path: str, title: str, status_msg, uid: int, chat_
         except Exception:
             try: await tgclient.forward_messages(chat_id, sent.id, from_peer=STORAGE_CHANNEL_ID)
             except Exception: pass
+        if _ask_name_on(chat_id):
+            asyncio.ensure_future(_ask_name_prompt(status_msg.get_bot(), chat_id, _new_file_id, clean_title))
     except asyncio.CancelledError:
         cancelled = True
         raise
@@ -4153,6 +4183,14 @@ async def on_message(u: Update, c: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f'*{len(rows)} result(s)* for "{q}"', reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
         return
 
+    _rt = getattr(msg, "reply_to_message", None)
+    if msg.text and _rt is not None and (u.effective_chat.id, getattr(_rt, "message_id", None)) in pending_names:
+        _fid = pending_names.pop((u.effective_chat.id, _rt.message_id))
+        _nm = re.sub(r"[\r\n\t]+", " ", msg.text).strip()[:200]
+        if _nm:
+            await _do_rename(c.bot, msg, _fid, _nm, echo_chat=u.effective_chat.id)
+        return
+
     if "db_id" in pending_rename.get(uid, {}) and msg.text:
         data = pending_rename.pop(uid)
         await _do_rename(c.bot, msg, data["db_id"], msg.text.strip(), echo_chat=u.effective_chat.id)
@@ -4177,7 +4215,10 @@ async def on_message(u: Update, c: ContextTypes.DEFAULT_TYPE):
                 queued_n = len(fresh) - (1 if need_worker else 0)
                 notes = []
                 if queued_n > 0:
-                    notes.append(f"➕ {queued_n} link{'s' if queued_n != 1 else ''} queued - one download at a time.")
+                    # waiting = links in the queue not yet started; the one being downloaded is counted separately
+                    waiting = max(q.qsize() - (1 if need_worker else 0), queued_n)
+                    notes.append(f"➕ {queued_n} link{'s' if queued_n != 1 else ''} queued - one download at a time.\n"
+                                 f"📋 Waiting now: {waiting} (plus 1 downloading).")
                 if dupes:
                     notes.append(f"⏭️ {dupes} duplicate{'s' if dupes != 1 else ''} skipped (already downloading or queued).")
                 if notes:
@@ -4217,6 +4258,11 @@ async def button_handler(u: Update, c: ContextTypes.DEFAULT_TYPE):
     uid  = q.from_user.id
     data = q.data or ""
 
+    if data == "ASKN|skip":
+        pending_names.pop((q.message.chat_id, q.message.message_id), None)
+        try: await q.edit_message_text("⏭ Skipped - name kept.")
+        except Exception: pass
+        return
     if await kept_button(q, data): return
     if data == "BACK": return await send_vault_page(q, 0, edit=True)
     if data == "SEARCH":
@@ -4473,6 +4519,18 @@ def start_bridge(loop, bot):
     threading.Thread(target=srv.serve_forever, daemon=True, name="tv-bridge").start()
     return srv
 
+async def askname_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    cid = u.effective_chat.id
+    arg = (c.args[0].lower() if c.args else "")
+    if arg in ("on", "off"):
+        _ask_name_set(cid, arg == "on")
+    on = _ask_name_on(cid)
+    await u.message.reply_text(
+        f"Ask for name is {'ON' if on else 'OFF'}.\n"
+        + ("After each finished upload I will ask for a visible name (reply to the question, or Skip). Downloads keep going meanwhile.\n" if on
+           else "No naming questions; uploads behave as usual.\n")
+        + "Use /askname on or /askname off.")
+
 async def kept_cmd(u: Update, c: ContextTypes.DEFAULT_TYPE):
     rows = [r for r in _kept_rows() if r[3] == u.effective_chat.id]
     if not rows:
@@ -4573,6 +4631,7 @@ async def main():
         BotCommand("dl", "Download video from URL"),
         BotCommand("stream", "Download a direct media/playlist URL"),
         BotCommand("kept", "Files kept after a failed upload: Retry / Delete"),
+        BotCommand("askname", "Ask for a video name after each upload: on / off"),
         BotCommand("pair", "Pair the browser extension (owner)"),
         BotCommand("unpair", "Revoke paired browsers (owner)"),
         BotCommand("thumb", "Set custom video thumbnail"),
@@ -4605,6 +4664,7 @@ async def main():
     app.add_handler(CommandHandler(["dl", "snatch"], dl_cmd))
     app.add_handler(CommandHandler("stream",    stream_cmd))
     app.add_handler(CommandHandler("kept",      kept_cmd))
+    app.add_handler(CommandHandler("askname",   askname_cmd))
     app.add_handler(CommandHandler("pair",      pair_cmd))
     app.add_handler(CommandHandler("unpair",    unpair_cmd))
     app.add_handler(CommandHandler("mp3",       mp3_cmd))
